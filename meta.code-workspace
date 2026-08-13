@@ -1,0 +1,19 @@
+{
+	"folders": [
+		{
+			"path": "../meta"
+		},
+		{
+			"path": "../business-messaging-sample-tech-provider-app"
+		},
+		{
+			"path": "."
+		},
+		{
+			"path": "../meta-app-review-demo"
+		}
+	],
+	"settings": {
+		"powershell.cwd": "meta"
+	}
+}

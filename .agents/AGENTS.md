@@ -4,6 +4,30 @@ This document stores the configuration, production paths, ports, PM2 processes, 
 
 ## 0. CHANGELOG (recent sessions)
 
+### Aug 13-14, 2026 — Meta App Review & Instagram Comments Funnel (AIDA) + Responsive Inbox
+- **Meta App Review Re-submission Preparation:**
+  - Rejected permissions addressed: `instagram_business_manage_comments`, `instagram_manage_comments`, `instagram_content_publish`, `instagram_manage_insights`, and `Human Agent`.
+  - **Decision:** Removed dependency on simulated static demos (`/demo/index.html`); all features are now fully integrated and recorded in the native SaaS CRM (`https://mbtechpanel.mbtech.work/`).
+- **Instagram Comments Moderation (`instagram_manage_comments`):**
+  - Interactive comment cards directly in `/my-inbox` with buttons: **`Responder en Post (Público)`** and **`Ocultar Comentario`**.
+  - Direct integration with Meta Graph API v20.0: `POST /{comment-id}/replies` and `POST /{comment-id}?is_hidden=true`.
+  - Also available in `/post-autoresponder` tab 3 with live post fetching.
+  - Eliminated all native browser `prompt()` and `alert()` popups in favor of stylized React/Tailwind modals and inline inputs.
+- **Intelligent Comment Autoresponder (AIDA Funnel):**
+  - Evaluates incoming comments via LLM / keyword matching in `app/api/webhooks/messenger/route.ts`:
+    1. **`OBSCENE`**: Toxic/abusive comments are auto-hidden via API without replies.
+    2. **`INTEREST / KEYWORD`**: Public confirmation reply + automated Private DM with AIDA sales pitch and CTA.
+    3. **`OTHER / CASUAL`**: Polite public reply only (`¡Muchas gracias por tu comentario...!`) without sending unsolicited DMs.
+- **Responsive Layout & Split-Screen Video UX:**
+  - Optimized `/my-inbox` for split-screen recordings (browser side-by-side with Instagram app):
+    - `PhoneListSidebar` reduced to `w-56 md:w-60 lg:w-64` with high-contrast text and dark/light mode consistency.
+    - Conversation list reduced to `w-52 md:w-56 lg:w-60`.
+    - Main conversation area expanded with `overflow-x-hidden` (no horizontal scrollbar).
+- **Instagram Content Publishing (`instagram_content_publish`):**
+  - Native publisher active in `/post-autoresponder` tab 2 (`POST /{ig-user-id}/media` + `POST /{ig-user-id}/media_publish`).
+- **Human Agent Tag (`Human Agent`):**
+  - Automatic transfer and live manual intervention in `/my-inbox` with badge and bot auto-switch.
+
 ### Jul 16, 2026 — Session updates
 - **CRM admin password changed** from `admin` to `Garcialv1959/` (deployed to `/root/crm-saas/.env.local`, pm2 restarted). User: `admin@mbtech.work`.
 - **MBTech is now Meta Tech Provider** (approved). App ID `1723073642211098`, Business ID `1047109242354157`.

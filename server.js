@@ -149,19 +149,35 @@ app.post('/api/internal/log-outbound', verifyInternalAuth, async (req, res) => {
   const displayContent = content || CONTENT_FALLBACK[type] || `[${type}]`;
 
   try {
-    // 1. Buscar la conversación en la BD por phone_number_id + customer_phone
     const cleanPhone = String(customer_phone).replace(/^\+/, '');
-    const { data: convData, error: convErr } = await supabaseMeta
-      .from('conversations')
-      .select('id, waba_id')
-      .eq('phone_number_id', phone_number_id)
-      .eq('customer_phone', cleanPhone)
-      .maybeSingle();
+    let convData = null;
 
-    if (convErr) {
-      console.error('[LOG-OUTBOUND] ❌ Error buscando conversación:', convErr.message);
-      return;
+    if (pgPool) {
+      try {
+        const { rows: cRows } = await pgPool.query(
+          'SELECT id, waba_id FROM meta_saas.conversations WHERE phone_number_id = $1 AND customer_phone = $2 LIMIT 1',
+          [phone_number_id, cleanPhone]
+        );
+        if (cRows.length > 0) convData = cRows[0];
+      } catch (dbErr) {
+        console.error('[LOG-OUTBOUND] ❌ Error buscando conversación en PostgreSQL:', dbErr.message);
+      }
     }
+
+    if (!convData && supabaseMeta) {
+      const { data, error: convErr } = await supabaseMeta
+        .from('conversations')
+        .select('id, waba_id')
+        .eq('phone_number_id', phone_number_id)
+        .eq('customer_phone', cleanPhone)
+        .maybeSingle();
+
+      if (convErr) {
+        console.error('[LOG-OUTBOUND] ❌ Error buscando conversación:', convErr.message);
+      }
+      convData = data;
+    }
+
     if (!convData?.id) {
       console.warn(`[LOG-OUTBOUND] ⚠️ Sin conversación para phone_number_id=${phone_number_id}, customer=${cleanPhone}`);
       return;
@@ -170,22 +186,40 @@ app.post('/api/internal/log-outbound', verifyInternalAuth, async (req, res) => {
     // 2. Insertar el mensaje saliente en meta_saas.messages
     const msgId = message_id || `bot_out_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const nowTimestamp = Math.floor(Date.now() / 1000);
-    const { error: insertErr } = await supabaseMeta
-      .from('messages')
-      .insert({
-        conversation_id: convData.id,
-        direction:       'outbound',
-        content:         displayContent,
-        message_id:      msgId,
-        sender_name:     sender_name,
-        media_url:       media_url,
-        media_type:      media_type || (type !== 'text' ? type : null),
-        timestamp:       nowTimestamp,
-      });
+    let insertSuccess = false;
 
-    if (insertErr) {
-      console.error('[LOG-OUTBOUND] ❌ Error insertando mensaje:', insertErr.message);
-    } else {
+    if (pgPool) {
+      try {
+        await pgPool.query(
+          `INSERT INTO meta_saas.messages (conversation_id, direction, content, message_id, sender_name, media_url, media_type, timestamp)
+           VALUES ($1, 'outbound', $2, $3, $4, $5, $6, $7)`,
+          [convData.id, displayContent, msgId, sender_name, media_url, media_type || (type !== 'text' ? type : null), nowTimestamp]
+        );
+        insertSuccess = true;
+      } catch (pgInsertErr) {
+        console.error('[LOG-OUTBOUND] ❌ Error insertando mensaje en PostgreSQL:', pgInsertErr.message);
+      }
+    }
+
+    if (!insertSuccess && supabaseMeta) {
+      const { error: insertErr } = await supabaseMeta
+        .from('messages')
+        .insert({
+          conversation_id: convData.id,
+          direction:       'outbound',
+          content:         displayContent,
+          message_id:      msgId,
+          sender_name:     sender_name,
+          media_url:       media_url,
+          media_type:      media_type || (type !== 'text' ? type : null),
+          timestamp:       nowTimestamp,
+        });
+
+      if (!insertErr) insertSuccess = true;
+      else console.error('[LOG-OUTBOUND] ❌ Error insertando mensaje en Supabase:', insertErr.message);
+    }
+
+    if (insertSuccess) {
       const icon = { image:'🖼️', audio:'🎵', voice:'🎤', video:'🎬', document:'📄', location:'📍', text:'💬' }[type] || '📩';
       console.log(`[LOG-OUTBOUND] ${icon} [${type}] de "${sender_name}" guardado en conv: ${convData.id}`);
 

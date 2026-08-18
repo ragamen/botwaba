@@ -38,7 +38,7 @@ if (postgresUrl) {
     connectionString: postgresUrl,
     options: '-c search_path=meta_saas,public'
   });
-  setBCVPgPool(pgPool);
+setBCVPgPool(pgPool);
 }
 
 if (supabaseUrl && supabaseKey) {
@@ -47,7 +47,7 @@ if (supabaseUrl && supabaseKey) {
     realtime: { transport: WebSocket },
     db: { schema: 'botwaba' }
   });
-
+  
   supabaseMeta = createClient(supabaseUrl, supabaseKey, {
     auth: { persistSession: false },
     realtime: { transport: WebSocket },
@@ -109,7 +109,7 @@ async function checkAndRefreshWindow(inbox_id, recipient, conversationId) {
   if (lastInboundTime) {
     const elapsedSeconds = now - lastInboundTime;
     isOpen = elapsedSeconds < 86400;
-
+    
     if (isOpen) {
       const remainingTTL = Math.max(1, 86400 - elapsedSeconds);
       try {
@@ -131,12 +131,81 @@ async function checkAndRefreshWindow(inbox_id, recipient, conversationId) {
   return isOpen;
 }
 
+// ====== SISTEMA DE DEBOUNCE (ANTI-SPAM / DOBLE RESPUESTA) ======
+const messageQueues = new Map();
+
+/**
+ * Envoltorio para encolar mensajes que llegan muy rápido y evitar que el bot responda doble.
+ */
+async function processMessage(payload) {
+  const { recipient, phoneNumberId, message, button_text, button, location } = payload;
+  
+  // Extraer texto
+  let text = '';
+  if (message) {
+    if (typeof message === 'string') text = message;
+    else if (typeof message === 'object') text = message.body || message.text || message.button?.text || '';
+  } else if (button_text) {
+    text = button_text;
+  } else if (button?.text) {
+    text = button.text;
+  }
+
+  // Clave única por WABA y Cliente
+  const queueKey = `${phoneNumberId}_${recipient}`;
+
+  if (!messageQueues.has(queueKey)) {
+    messageQueues.set(queueKey, {
+      timer: null,
+      messages: [],
+      payloads: []
+    });
+  }
+
+  const queue = messageQueues.get(queueKey);
+  
+  // Agregar texto o una marca de (Ubicación)
+  if (text.trim() !== '') {
+    queue.messages.push(text.trim());
+  } else if (location) {
+    queue.messages.push('(Ubicación recibida)');
+  }
+  
+  queue.payloads.push(payload);
+
+  if (queue.timer) clearTimeout(queue.timer);
+
+  queue.timer = setTimeout(async () => {
+    messageQueues.delete(queueKey);
+    
+    // Unir todos los textos recibidos en este lapso
+    const mergedText = queue.messages.join('\n');
+    // Tomar el último payload como base
+    const finalPayload = queue.payloads[queue.payloads.length - 1];
+    
+    // Sobrescribir el mensaje con el texto unificado (si hubo texto)
+    if (mergedText) {
+      if (typeof finalPayload.message === 'object') {
+        if (finalPayload.message.text) finalPayload.message.text = mergedText;
+        else if (finalPayload.message.body) finalPayload.message.body = mergedText;
+      } else {
+        finalPayload.message = mergedText;
+      }
+      finalPayload.messageText = mergedText;
+    }
+    
+    console.log(`[DEBOUNCE] Procesando lote de ${queue.messages.length} mensajes para ${recipient}.`);
+    await doProcessMessage(finalPayload);
+  }, 600); // 600ms de agrupación para máxima velocidad de respuesta
+}
+// ===============================================================
+
 /**
  * Procesa as??ncronamente el mensaje entrante desde el SaaS CRM.
  */
-async function processMessage(payload) {
-  if (!supabase || !supabaseMeta) {
-    console.error('[BOT] ??? No hay cliente de Supabase configurado. Ignorando mensaje.');
+async function doProcessMessage(payload) {
+  if (!pgPool && (!supabase || !supabaseMeta)) {
+    console.error('[BOT] ❌ No hay cliente de base de datos configurado. Ignorando mensaje.');
     return;
   }
 
@@ -259,7 +328,7 @@ async function processMessage(payload) {
   // 2. Obtener datos din??micos (Cach?? de Configuraci??n o Supabase)
   let botConfig = null;
   const configCacheKey = `inbox:${inbox_id}:config`;
-
+  
   try {
     const cachedConfig = await redisClient.get(configCacheKey);
     if (cachedConfig) {
@@ -271,24 +340,55 @@ async function processMessage(payload) {
   }
 
   if (!botConfig) {
-    console.log(`[BOT] ???? Consultando base de datos para obtener configuraci??n de inbox_id: ${inbox_id}...`);
-    const { data: cliente, error: dbError } = await supabase
-      .from('clientes_bot')
-      .select('ai_model, system_prompt, bot_module_type, is_delivery_enabled, address_details, payment_pago_movil, commerce_settings')
-      .eq('inbox_id', inbox_id)
-      .single();
+    console.log(`[BOT] 📡 Consultando base de datos para obtener configuración de inbox_id: ${inbox_id}...`);
+    let cliente = null;
+    let saasClient = null;
 
-    const { data: saasClient } = await supabaseMeta
-      .from('saas_clients')
-      .select('company_name, business_nature, status, created_at, subscription_expires_at')
-      .eq('inbox_id', inbox_id)
-      .single();
+    if (pgPool) {
+      try {
+        const { rows: cbRows } = await pgPool.query(
+          'SELECT ai_model, system_prompt, bot_module_type, is_delivery_enabled, address_details, payment_pago_movil, commerce_settings FROM botwaba.clientes_bot WHERE inbox_id = $1 LIMIT 1',
+          [inbox_id]
+        );
+        if (cbRows.length > 0) cliente = cbRows[0];
 
-    if (dbError || !cliente) {
-      console.error(`[BOT] ??? No se encontr?? cliente para inbox_id ${inbox_id}:`, dbError?.message);
+        const { rows: scRows } = await pgPool.query(
+          'SELECT company_name, business_nature, status, created_at, subscription_expires_at FROM meta_saas.saas_clients WHERE inbox_id = $1 LIMIT 1',
+          [inbox_id]
+        );
+        if (scRows.length > 0) saasClient = scRows[0];
+      } catch (pgErr) {
+        console.error('[BOT] Error consultando PostgreSQL para botConfig:', pgErr.message);
+      }
+    }
+
+    if (!cliente && supabase) {
+      try {
+        const { data: c } = await supabase
+          .from('clientes_bot')
+          .select('ai_model, system_prompt, bot_module_type, is_delivery_enabled, address_details, payment_pago_movil, commerce_settings')
+          .eq('inbox_id', inbox_id)
+          .single();
+        cliente = c;
+      } catch (e) {}
+    }
+
+    if (!saasClient && supabaseMeta) {
+      try {
+        const { data: sc } = await supabaseMeta
+          .from('saas_clients')
+          .select('company_name, business_nature, status, created_at, subscription_expires_at')
+          .eq('inbox_id', inbox_id)
+          .single();
+        saasClient = sc;
+      } catch (e) {}
+    }
+
+    if (!cliente) {
+      console.error(`[BOT] ❌ No se encontró cliente para inbox_id ${inbox_id}`);
       return;
     }
-    //
+
     botConfig = {
       aiModel: cliente.ai_model || modeloPorDefecto,
       system_prompt: cliente.system_prompt || '',
@@ -354,13 +454,13 @@ async function processMessage(payload) {
 
   if (isExpired && botModuleType !== 'disabled' && botModuleType !== 'taxi') {
     console.log(`[BOT] ⚠️ Suscripción vencida o período de gracia de 5 días agotado para inbox_id: ${inbox_id}. Bloqueando.`);
-
+    
     // Auto-suspender en la base de datos de forma asíncrona
     try {
       if (pgPool) {
         await pgPool.query("UPDATE meta_saas.saas_clients SET status = 'Suspended' WHERE inbox_id = $1", [inbox_id]);
       }
-    } catch (e) { }
+    } catch (e) {}
 
     const alertMsg = "⚠️ Este asistente virtual se encuentra suspendido por vencimiento de suscripción. Por favor contacta al administrador.";
     try {
@@ -513,7 +613,7 @@ async function processMessage(payload) {
           }
         }
       }
-    } catch (e) { }
+    } catch(e) {}
     // Tambien incluir admin_phones de clientes_bot (backward compatible)
     if (commerceSettings && Array.isArray(commerceSettings.admin_phones)) {
       adminPhones = adminPhones.concat(commerceSettings.admin_phones);
@@ -560,7 +660,7 @@ async function processMessage(payload) {
           }
         }
       }
-    } catch (e) { }
+    } catch(e) {}
 
     // Si es motorizado registrado y NO es admin, responder con su enlace de despacho PWA
     if (isDriver && !isAdmin) {
@@ -596,7 +696,7 @@ async function processMessage(payload) {
               `🛵 *¡Hola Repartidor de ${driverBusinessName}!* Aquí tienes tu Enlace de Despacho PWA:\n\n${driverLink}\n\nÁbrelo para ver tus entregas activas en tiempo real.`
             );
           }
-        } catch (e) {
+        } catch(e) {
           console.error('[COMMERCE-DRIVER] Error generando token motorizado:', e.message);
         }
         return;
@@ -612,7 +712,7 @@ async function processMessage(payload) {
         const helpBody = { messaging_product: 'whatsapp', recipient_type: 'individual', to: senderPhone, type: 'text', text: { preview_url: false, body: helpText } };
         try {
           await fetch('https://graph.facebook.com/v20.0/' + phoneNumberId + '/messages', { method: 'POST', headers: { 'Authorization': 'Bearer ' + accessToken, 'Content-Type': 'application/json' }, body: JSON.stringify(helpBody) });
-        } catch (e) { console.error('[COMMERCE-ADMIN] Error ayuda:', e.message); }
+        } catch(e) { console.error('[COMMERCE-ADMIN] Error ayuda:', e.message); }
         return;
       }
 
@@ -621,7 +721,7 @@ async function processMessage(payload) {
       // Helper: enviar a un numero especifico + persistir en BD + Ably
       const sendToPhone = async (phone, text, imageUrl) => {
         const p = String(phone).replace(/^\+/, '');
-        const msgId = 'msg_bot_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5);
+        const msgId = 'msg_bot_' + Date.now() + '_' + Math.random().toString(36).substr(2,5);
         const msgBody = imageUrl
           ? { messaging_product: 'whatsapp', recipient_type: 'individual', to: p, type: 'image', image: { link: imageUrl, caption: text } }
           : { messaging_product: 'whatsapp', recipient_type: 'individual', to: p, type: 'text', text: { preview_url: false, body: text } };
@@ -634,20 +734,20 @@ async function processMessage(payload) {
           try {
             const { rows: cr } = await pgPool.query('SELECT id FROM meta_saas.conversations WHERE phone_number_id=$1 AND customer_phone=$2 LIMIT 1', [inbox_id, p]);
             if (cr[0]) targetConvId = cr[0].id;
-          } catch (e) { }
+          } catch(e) {}
         }
         try {
-          if (pgPool) await pgPool.query('INSERT INTO messages (conversation_id, direction, content, message_id, sender_name, timestamp) VALUES ($1,$2,$3,$4,$5,$6)', [targetConvId, 'outbound', text, msgId, 'BotWaba Commerce', Math.floor(Date.now() / 1000)]);
+          if (pgPool) await pgPool.query('INSERT INTO messages (conversation_id, direction, content, message_id, sender_name, timestamp) VALUES ($1,$2,$3,$4,$5,$6)', [targetConvId, 'outbound', text, msgId, 'BotWaba Commerce', Math.floor(Date.now()/1000)]);
           if (ablyKey) {
             try {
               const ai = new Ably.Realtime({ key: ablyKey, clientId: 'botwaba_commerce' });
               await ai.connection.once('connected');
               const ch = ai.channels.get('get-started');
-              await ch.publish('first', { object: 'whatsapp_business_account', entry: [{ id: wabaId, changes: [{ value: { messaging_product: 'whatsapp', metadata: { phone_number_id: phoneNumberId }, messages: [imageUrl ? { id: msgId, from: '_ackbot_', type: 'image', image: { link: imageUrl, caption: text }, timestamp: Math.floor(Date.now() / 1000), _ackbot_recipient: p } : { id: msgId, from: '_ackbot_', type: 'text', text: { body: text }, timestamp: Math.floor(Date.now() / 1000), _ackbot_recipient: p }] }, field: 'messages' }] }] });
+              await ch.publish('first', { object: 'whatsapp_business_account', entry: [{ id: wabaId, changes: [{ value: { messaging_product: 'whatsapp', metadata: { phone_number_id: phoneNumberId }, messages: [imageUrl ? { id: msgId, from: '_ackbot_', type: 'image', image: { link: imageUrl, caption: text }, timestamp: Math.floor(Date.now()/1000), _ackbot_recipient: p } : { id: msgId, from: '_ackbot_', type: 'text', text: { body: text }, timestamp: Math.floor(Date.now()/1000), _ackbot_recipient: p }] }, field: 'messages' }] }] });
               ai.close();
-            } catch (e) { console.error('[COMMERCE-ADMIN] Ably:', e.message); }
+            } catch(e) { console.error('[COMMERCE-ADMIN] Ably:', e.message); }
           }
-        } catch (e) { console.warn('[COMMERCE-ADMIN] Persist:', e.message); }
+        } catch(e) { console.warn('[COMMERCE-ADMIN] Persist:', e.message); }
       };
 
       // Comando: negocio / admin / panel (Generar enlaces PWA)
@@ -655,7 +755,7 @@ async function processMessage(payload) {
         const crypto = require('crypto');
         const kitchenToken = crypto.randomBytes(16).toString('hex');
         const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 horas
-
+        
         try {
           if (pgPool) {
             // Guardar token cocina
@@ -663,7 +763,7 @@ async function processMessage(payload) {
               'INSERT INTO botwaba.pwa_tokens (token, inbox_id, business_id, role, expires_at) VALUES ($1, $2, $3, $4, $5)',
               [kitchenToken, inbox_id, bizBusinessId, 'kitchen', expiresAt]
             );
-
+            
             // Generar token admin
             const adminToken = crypto.randomBytes(16).toString('hex');
             await pgPool.query(
@@ -673,10 +773,10 @@ async function processMessage(payload) {
 
             const kitchenLink = 'https://mbtechpanel.mbtech.work/orders-dashboard?t=' + kitchenToken;
             const adminLink = 'https://mbtechpanel.mbtech.work/orders-dashboard?t=' + adminToken;
-
+            
             await sendToPhone(senderPhone, '🔑 *Tus Enlaces de Acceso Seguro (PWA)*\n\n🍳 *Pantalla de Cocina (Pizzero):*\n' + kitchenLink + '\n\n📊 *Panel de Control Completo (Administrador):*\n' + adminLink + '\n\n*Nota:* Estos enlaces expiran en 24 horas. Puedes guardarlos en la pantalla de inicio de tu celular.');
           }
-        } catch (e) {
+        } catch(e) {
           console.error('[COMMERCE-ADMIN] Error generando tokens PWA:', e.message);
           await sendToPhone(senderPhone, 'Error generando los enlaces del panel. Inténtalo de nuevo.');
         }
@@ -688,7 +788,7 @@ async function processMessage(payload) {
         const crypto = require('crypto');
         const driverToken = crypto.randomBytes(16).toString('hex');
         const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 horas
-
+        
         try {
           if (pgPool) {
             await pgPool.query(
@@ -698,7 +798,7 @@ async function processMessage(payload) {
             const driverLink = 'https://mbtechpanel.mbtech.work/orders-dashboard?t=' + driverToken;
             await sendToPhone(senderPhone, '🛵 *Enlace de Despacho para Motorizado:*\n\n' + driverLink + '\n\nEnvíaselo a tu repartidor para que pueda gestionar y entregar los pedidos en tiempo real.');
           }
-        } catch (e) {
+        } catch(e) {
           console.error('[COMMERCE-ADMIN] Error generando token motorizado:', e.message);
         }
         return;
@@ -713,7 +813,7 @@ async function processMessage(payload) {
           await sendToPhone(senderPhone, pending.length + ' pedido(s) pendiente(s):');
           for (const ord of pending) {
             const bizName = ord.business_name ? ' (' + ord.business_name + ')' : '';
-            const cap = ord.order_number + bizName + '\n' + parseFloat(ord.total_usd).toFixed(2) + ' / Bs. ' + parseFloat(ord.total_bs || 0).toFixed(2) + '\nCliente: ' + ord.customer_phone + '\n' + (ord.delivery_type === 'delivery' ? 'Delivery' : 'Pickup') + (ord.delivery_address ? '\n📍 ' + ord.delivery_address : '') + '\n\nEscribe *confirmar ' + ord.order_number.replace('ORD-', '') + '* o *rechazar ' + ord.order_number.replace('ORD-', '') + '*';
+            const cap = ord.order_number + bizName + '\n' + parseFloat(ord.total_usd).toFixed(2) + ' / Bs. ' + parseFloat(ord.total_bs||0).toFixed(2) + '\nCliente: ' + ord.customer_phone + '\n' + (ord.delivery_type==='delivery'?'Delivery':'Pickup') + (ord.delivery_address ? '\n📍 ' + ord.delivery_address : '') + '\n\nEscribe *confirmar ' + ord.order_number.replace('ORD-','') + '* o *rechazar ' + ord.order_number.replace('ORD-','') + '*';
             if (ord.proof_media_url) await sendToPhone(senderPhone, cap, ord.proof_media_url);
             else await sendToPhone(senderPhone, cap + '\n(sin comprobante)');
           }
@@ -757,78 +857,78 @@ async function processMessage(payload) {
           if (orders.length === 0) { await sendToPhone(senderPhone, 'No encontre el pedido ' + orderNum + '. Escribe *pendientes* para ver los pedidos.'); return; }
           const ord = orders[0];
           let newStatus = ord.status, clientMsg = '', adminMsg = '';
-          if (action === 'confirmar') { newStatus = 'paid'; clientMsg = 'Pago confirmado! #' + ord.order_number + '\n\nTu pedido esta en preparacion. Te avisamos cuando este listo.'; adminMsg = ord.order_number + ' confirmado. Avise al cliente.'; }
-          else if (action === 'listo') {
-            newStatus = 'ready';
-            const isDelivery = ord.delivery_type === 'delivery';
-            if (isDelivery) {
-              clientMsg = 'Tu pedido #' + ord.order_number + ' esta listo! En breve nuestro motorizado lo retirara del local para llevartelo.';
+          if (action === 'confirmar') { newStatus='paid'; clientMsg='Pago confirmado! #' + ord.order_number + '\n\nTu pedido esta en preparacion. Te avisamos cuando este listo.'; adminMsg=ord.order_number + ' confirmado. Avise al cliente.'; }
+           else if (action === 'listo') {
+             newStatus='ready';
+             const isDelivery = ord.delivery_type === 'delivery';
+             if (isDelivery) {
+               clientMsg = 'Tu pedido #' + ord.order_number + ' esta listo! En breve nuestro motorizado lo retirara del local para llevartelo.';
 
-              // --- Notificar a los motorizados registrados ---
-              try {
-                let drivers = [];
-                // A. De commerce_businesses
-                if (ord.business_id) {
-                  const { rows: bizDrivers } = await pgPool.query(
-                    "SELECT driver_phones FROM botwaba.commerce_businesses WHERE id = $1 AND is_active = true LIMIT 1",
-                    [ord.business_id]
-                  );
-                  if (bizDrivers.length > 0 && Array.isArray(bizDrivers[0].driver_phones)) {
-                    drivers = bizDrivers[0].driver_phones;
-                  }
-                }
+               // --- Notificar a los motorizados registrados ---
+               try {
+                 let drivers = [];
+                 // A. De commerce_businesses
+                 if (ord.business_id) {
+                   const { rows: bizDrivers } = await pgPool.query(
+                     "SELECT driver_phones FROM botwaba.commerce_businesses WHERE id = $1 AND is_active = true LIMIT 1",
+                     [ord.business_id]
+                   );
+                   if (bizDrivers.length > 0 && Array.isArray(bizDrivers[0].driver_phones)) {
+                     drivers = bizDrivers[0].driver_phones;
+                   }
+                 }
 
-                // B. Fallback a clientes_bot
-                if (drivers.length === 0) {
-                  const { rows: cbDrivers } = await pgPool.query(
-                    "SELECT commerce_settings FROM botwaba.clientes_bot WHERE inbox_id = $1 LIMIT 1",
-                    [inbox_id]
-                  );
-                  if (cbDrivers.length > 0 && cbDrivers[0].commerce_settings?.driver_phones) {
-                    drivers = cbDrivers[0].commerce_settings.driver_phones;
-                  }
-                }
+                 // B. Fallback a clientes_bot
+                 if (drivers.length === 0) {
+                   const { rows: cbDrivers } = await pgPool.query(
+                     "SELECT commerce_settings FROM botwaba.clientes_bot WHERE inbox_id = $1 LIMIT 1",
+                     [inbox_id]
+                   );
+                   if (cbDrivers.length > 0 && cbDrivers[0].commerce_settings?.driver_phones) {
+                     drivers = cbDrivers[0].commerce_settings.driver_phones;
+                   }
+                 }
 
-                // C. Enviar mensaje de alerta a cada motorizado
-                if (drivers.length > 0) {
-                  const crypto = require('crypto');
-                  const bizName = ord.business_name || 'El Local';
-                  const destAddress = ord.delivery_address || 'Dirección no especificada';
+                 // C. Enviar mensaje de alerta a cada motorizado
+                 if (drivers.length > 0) {
+                   const crypto = require('crypto');
+                   const bizName = ord.business_name || 'El Local';
+                   const destAddress = ord.delivery_address || 'Dirección no especificada';
 
-                  for (const dPhone of drivers) {
-                    const cleanDPhone = String(dPhone).replace(/^\+/, '');
+                   for (const dPhone of drivers) {
+                     const cleanDPhone = String(dPhone).replace(/^\+/, '');
 
-                    // Generar token temporal de 24h para el motorizado
-                    const driverToken = crypto.randomBytes(16).toString('hex');
-                    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+                     // Generar token temporal de 24h para el motorizado
+                     const driverToken = crypto.randomBytes(16).toString('hex');
+                     const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
 
-                    await pgPool.query(
-                      "INSERT INTO botwaba.pwa_tokens (token, inbox_id, business_id, role, expires_at) VALUES ($1, $2, $3, $4, $5)",
-                      [driverToken, inbox_id, ord.business_id, 'delivery', expiresAt]
-                    );
+                     await pgPool.query(
+                       "INSERT INTO botwaba.pwa_tokens (token, inbox_id, business_id, role, expires_at) VALUES ($1, $2, $3, $4, $5)",
+                       [driverToken, inbox_id, ord.business_id, 'delivery', expiresAt]
+                     );
 
-                    const driverLink = 'https://mbtechpanel.mbtech.work/orders-dashboard?t=' + driverToken;
-                    const driverAlert = `🛵 *¡Nuevo Despacho Listo!* \nEl pedido *${ord.order_number}* de *${bizName}* está listo para ser entregado.\n\n📍 *Dirección:* ${destAddress}\n💵 *Monto:* $${parseFloat(ord.total_usd).toFixed(2)} (${parseFloat(ord.total_bs || 0).toFixed(0)} Bs)\n\n👉 *Abre tu panel para tomar la entrega:*\n${driverLink}`;
+                     const driverLink = 'https://mbtechpanel.mbtech.work/orders-dashboard?t=' + driverToken;
+                     const driverAlert = `🛵 *¡Nuevo Despacho Listo!* \nEl pedido *${ord.order_number}* de *${bizName}* está listo para ser entregado.\n\n📍 *Dirección:* ${destAddress}\n💵 *Monto:* $${parseFloat(ord.total_usd).toFixed(2)} (${parseFloat(ord.total_bs || 0).toFixed(0)} Bs)\n\n👉 *Abre tu panel para tomar la entrega:*\n${driverLink}`;
 
-                    await sendToPhone(cleanDPhone, driverAlert);
-                  }
-                }
-              } catch (driverErr) {
-                console.error('[COMMERCE-ADMIN-LISTO] Error al alertar motorizados:', driverErr.message);
-              }
-            } else {
-              clientMsg = 'Tu pedido #' + ord.order_number + ' esta listo! Puedes pasarte a buscarlo.';
-            }
-            adminMsg = ord.order_number + ' marcado como listo.';
-          }
+                     await sendToPhone(cleanDPhone, driverAlert);
+                   }
+                 }
+               } catch (driverErr) {
+                 console.error('[COMMERCE-ADMIN-LISTO] Error al alertar motorizados:', driverErr.message);
+               }
+             } else {
+               clientMsg = 'Tu pedido #' + ord.order_number + ' esta listo! Puedes pasarte a buscarlo.';
+             }
+             adminMsg = ord.order_number + ' marcado como listo.';
+           }
           else if (action === 'enviado' || action === 'encamino') {
-            newStatus = 'shipped';
+            newStatus='shipped';
             const adminPhone = adminPhones[0] || senderPhone;
             const adminDisplay = adminPhone.startsWith('+') ? adminPhone : '+' + adminPhone;
             clientMsg = 'Tu pedido *' + ord.order_number + '* va en camino! 🛵\n\nEn breve llega a tu dirección. 📍\n\nSi tienes algún problema, escríbenos directo al WhatsApp del negocio:\n📱 ' + adminDisplay + '\n\n¡Gracias por tu compra! 🙏';
             adminMsg = ord.order_number + ' marcado como enviado. Cliente notificado con tu teléfono: ' + adminDisplay;
           }
-          else if (action === 'rechazar') { newStatus = 'rejected'; clientMsg = 'No pudimos verificar tu pago para #' + ord.order_number + '. Por favor contactanos.'; adminMsg = ord.order_number + ' rechazado. Avise al cliente.'; }
+          else if (action === 'rechazar') { newStatus='rejected'; clientMsg='No pudimos verificar tu pago para #' + ord.order_number + '. Por favor contactanos.'; adminMsg=ord.order_number + ' rechazado. Avise al cliente.'; }
           await pgPool.query('UPDATE botwaba.pedidos SET status=$1, updated_at=NOW() WHERE id=$2', [newStatus, ord.id]);
           if (clientMsg) await sendToPhone(ord.customer_phone, clientMsg);
           if (adminMsg) await sendToPhone(senderPhone, adminMsg);
@@ -913,8 +1013,8 @@ async function processMessage(payload) {
       }
 
       try {
-        if (pgPool) await pgPool.query('INSERT INTO messages (conversation_id, direction, content, message_id, sender_name, timestamp) VALUES ($1,$2,$3,$4,$5,$6)', [conversationId, 'outbound', text, msgId, 'BotWaba Commerce', Math.floor(Date.now() / 1000)]);
-        if (ablyKey) { try { const ai = new Ably.Realtime({ key: ablyKey, clientId: 'botwaba_commerce' }); await ai.connection.once('connected'); const ch = ai.channels.get('get-started'); await ch.publish('first', { object: 'whatsapp_business_account', entry: [{ id: wabaId, changes: [{ value: { messaging_product: 'whatsapp', metadata: { phone_number_id: phoneNumberId }, messages: [lastPayloadSent ? { id: msgId, from: '_ackbot_', type: 'interactive', interactive: lastPayloadSent, timestamp: Math.floor(Date.now() / 1000), _ackbot_recipient: recipient } : (imageUrl ? { id: msgId, from: '_ackbot_', type: 'image', image: { link: imageUrl, caption: text }, timestamp: Math.floor(Date.now() / 1000), _ackbot_recipient: recipient } : { id: msgId, from: '_ackbot_', type: 'text', text: { body: text }, timestamp: Math.floor(Date.now() / 1000), _ackbot_recipient: recipient })] }, field: 'messages' }] }] }); ai.close(); } catch (e) { console.error('[COMMERCE] Ably:', e.message); } }
+        if (pgPool) await pgPool.query('INSERT INTO messages (conversation_id, direction, content, message_id, sender_name, timestamp) VALUES ($1,$2,$3,$4,$5,$6)', [conversationId, 'outbound', text, msgId, 'BotWaba Commerce', Math.floor(Date.now()/1000)]);
+        if (ablyKey) { try { const ai = new Ably.Realtime({ key: ablyKey, clientId: 'botwaba_commerce' }); await ai.connection.once('connected'); const ch = ai.channels.get('get-started'); await ch.publish('first', { object: 'whatsapp_business_account', entry: [{ id: wabaId, changes: [{ value: { messaging_product: 'whatsapp', metadata: { phone_number_id: phoneNumberId }, messages: [lastPayloadSent ? { id: msgId, from: '_ackbot_', type: 'interactive', interactive: lastPayloadSent, timestamp: Math.floor(Date.now()/1000), _ackbot_recipient: recipient } : (imageUrl ? { id: msgId, from: '_ackbot_', type: 'image', image: { link: imageUrl, caption: text }, timestamp: Math.floor(Date.now()/1000), _ackbot_recipient: recipient } : { id: msgId, from: '_ackbot_', type: 'text', text: { body: text }, timestamp: Math.floor(Date.now()/1000), _ackbot_recipient: recipient })] }, field: 'messages' }] }] }); ai.close(); } catch(e) { console.error('[COMMERCE] Ably:', e.message); } }
       } catch (e) { console.warn('[COMMERCE] Persist:', e.message); }
       return success;
     };
@@ -942,11 +1042,11 @@ async function processMessage(payload) {
         if (contactRows[0] && contactRows[0].name) {
           customerName = contactRows[0].name;
         }
-      } catch (e) { }
+      } catch (e) {}
 
       // Cargar sesion del cliente
       let session = null;
-      try { const { rows: sr } = await pgPool.query('SELECT * FROM botwaba.commerce_sessions WHERE inbox_id=$1 AND customer_phone=$2 LIMIT 1', [inbox_id, recipient]); session = sr[0] || null; } catch (e) { }
+      try { const { rows: sr } = await pgPool.query('SELECT * FROM botwaba.commerce_sessions WHERE inbox_id=$1 AND customer_phone=$2 LIMIT 1', [inbox_id, recipient]); session = sr[0] || null; } catch (e) {}
 
       // ── Cargar negocios disponibles para este inbox_id ────────────────
       let businesses = [];
@@ -960,7 +1060,7 @@ async function processMessage(payload) {
         try {
           await upsertCommerceSession(pgPool, inbox_id, recipient, { business_id: businesses[0].id, state: 'IDLE' });
           session = { ...(session || {}), business_id: businesses[0].id, state: 'IDLE' };
-        } catch (e) { }
+        } catch(e) {}
       }
 
       // ── Comando 'negocios' / 'menu principal' / 'otro negocio' ────────
@@ -972,7 +1072,7 @@ async function processMessage(payload) {
       // ── Cargar config del negocio seleccionado (o fallback a clientes_bot) ──
       let bizConfig = null;
       if (session && session.business_id) {
-        try { const { rows: bc } = await pgPool.query('SELECT * FROM botwaba.commerce_businesses WHERE id=$1 LIMIT 1', [session.business_id]); bizConfig = bc[0]; } catch (e) { }
+        try { const { rows: bc } = await pgPool.query('SELECT * FROM botwaba.commerce_businesses WHERE id=$1 LIMIT 1', [session.business_id]); bizConfig = bc[0]; } catch(e) {}
       }
 
       // Enrutador de Macro-Modelos de Flujo
@@ -1042,7 +1142,7 @@ async function processMessage(payload) {
       }
     } catch (err) {
       console.error('[BOT] Error en commerce (Router):', err.message);
-      try { await quickSend('Lo siento, tuve un problema tecnico. Puedes escribir nuevamente?'); } catch (e) { }
+      try { await quickSend('Lo siento, tuve un problema tecnico. Puedes escribir nuevamente?'); } catch(e) {}
     }
     return;
   }
@@ -1109,14 +1209,14 @@ async function processMessage(payload) {
         },
         body: JSON.stringify(requestBody)
       });
-
+      
       if (!metaResponse.ok) {
         console.error('[BOT] Error enviando a Meta:', await metaResponse.text());
       }
     } catch (e) {
       console.error('[BOT] Error de red enviando a Meta:', e.message);
     }
-
+    
     // 2. Guardar en el CRM (SaaS)
     try {
       if (pgPool) {
@@ -1142,7 +1242,7 @@ async function processMessage(payload) {
           const ably = new Ably.Realtime({ key: ablyKey, clientId: 'botwaba_ai' });
           await ably.connection.once('connected');
           const channel = ably.channels.get('get-started');
-
+          
           const ackTimestamp = Date.now();
           const ackPayload = {
             object: 'whatsapp_business_account',
@@ -1253,11 +1353,11 @@ async function processMessage(payload) {
     }
     const infoToLearn = parts.slice(2).join(' ');
     await sendReply(`??? Procesando nueva informaci??n...\nGenerando conocimiento y vectorizando...`);
-
+    
     try {
       // Usamos Gemma para generar QA desde el texto crudo
       const systemPrompt = `Eres un experto en extracci??n de conocimiento. El usuario te dar?? un texto crudo. Extrae los datos importantes y genera un JSON con un arreglo "qas" donde cada objeto tiene "q" (pregunta/narrativa) y "a" (respuesta). Solo devuelve JSON v??lido.`;
-
+      
       const openRouterResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
         headers: {
@@ -1275,12 +1375,12 @@ async function processMessage(payload) {
       });
 
       if (!openRouterResponse.ok) throw new Error('Fallo al generar Q&A con la IA');
-
+      
       const aiData = await openRouterResponse.json();
       let content = aiData.choices?.[0]?.message?.content || '{}';
       content = content.replace(/^```json\s*/, '').replace(/\s*```$/, '');
       const parsedQa = JSON.parse(content);
-
+      
       if (!parsedQa.qas || parsedQa.qas.length === 0) {
         await sendReply(`??? La IA no pudo extraer conocimiento ??til de tu texto.`);
         return;
@@ -1306,13 +1406,13 @@ async function processMessage(payload) {
       await sendReply(`??? Acceso denegado: PIN incorrecto.`);
       return;
     }
-
+    
     try {
       const { error } = await supabase
         .from('company_knowledge')
         .delete()
         .eq('inbox_id', inbox_id.toString());
-
+        
       if (error) throw error;
       await sendReply(`??????? Memoria borrada. Soy un lienzo en blanco para este Inbox.`);
     } catch (e) {
@@ -1356,7 +1456,7 @@ async function processMessage(payload) {
             content: m.content
           });
         });
-
+        
         // Removemos el ??ltimo mensaje si coincide con el mensaje actual (para evitar pasarlo 2 veces)
         if (historyMessages.length > 0 && historyMessages[historyMessages.length - 1].content === message_content) {
           historyMessages.pop();
@@ -1386,10 +1486,10 @@ async function processMessage(payload) {
       if (!embedResponse.ok) {
         throw new Error(`Error en API de embeddings: ${await embedResponse.text()}`);
       }
-
+      
       const embedData = await embedResponse.json();
       const queryArray = embedData.data[0].embedding;
-
+      
       // Llamada RPC a Supabase para buscar similaridad
       const { data: matches, error: matchError } = await supabase.rpc('match_knowledge', {
         query_embedding: queryArray,
@@ -1402,11 +1502,11 @@ async function processMessage(payload) {
         console.error(`[BOT] ??? Error en match_knowledge:`, matchError.message);
       } else if (matches && matches.length > 0) {
         console.log(`[BOT] ??? Encontrados ${matches.length} fragmentos de conocimiento relevantes.`);
-
+        
         // Log logging usage
         const matchIds = matches.map(m => m.id);
         // Fire and forget update to increment usage count (optional)
-
+        
         // Construimos el contexto para inyectar
         companyContext = `\n\n--- INFORMACI??N DE LA EMPRESA (Basa tus respuestas estrictamente en esto si es relevante) ---\n`;
         matches.forEach(m => {
@@ -1421,7 +1521,7 @@ async function processMessage(payload) {
 
     // 3. Llamada a OpenRouter
     console.log(`[BOT] ???? OpenRouter (${aiModel}) procesando el texto con memoria y contexto RAG...`);
-
+    
     // Inyectamos el contexto de RAG en el system_prompt
     const handoffInstruction = `\n\n--- INSTRUCCI??N DE TRANSFERENCIA A HUMANO ---\nSi consideras que ya recopilaste los datos del cliente (nombre, tel??fono, empresa) para hacer una transferencia al equipo de ventas, O si no puedes responder a la solicitud y debes derivarlo a un humano, DEBES agregar al final de tu respuesta la etiqueta especial [NOTA_PRIVADA] seguida de un breve resumen de la situaci??n del cliente para que el agente humano lo lea en privado.\nEjemplo de tu respuesta:\n"En un momento un asesor te atender??.\n[NOTA_PRIVADA]\n- Cliente: Juan P??rez (555-1234)\n- Empresa: X\n- Requerimiento: Cotizaci??n de n??minas."`;
 
@@ -1429,7 +1529,7 @@ async function processMessage(payload) {
 
     // Prompt din??mico seg??n el tipo de m??dulo de bot activo
     let activePrompt = '';
-
+    
     if (botModuleType === 'retail_delivery') {
       activePrompt = `Eres el asistente de ventas oficial de la empresa "${activeBusinessName}", cuya naturaleza de negocio es: ${activeBusinessNature}.
 Tu objetivo es guiar a los clientes en su proceso de compra usando el embudo AIDA (Atenci??n, Inter??s, Deseo, Acci??n).
@@ -1479,7 +1579,7 @@ REGLAS DEL M??DULO (FAQ & SOPORTE):
       ...historyMessages,
       { role: 'user', content: message_content }
     ];
-
+    
     const llmStart = Date.now();
     const openRouterResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
@@ -1500,7 +1600,7 @@ REGLAS DEL M??DULO (FAQ & SOPORTE):
 
     const aiData = await openRouterResponse.json();
     const latencyMs = Date.now() - llmStart;
-
+    
     // Descontar tokens del saldo del cliente
     if (aiData.usage) {
       await deductAiTokens(aiData.usage, latencyMs, commerceSettings?.admin_phones || []);
@@ -1509,11 +1609,11 @@ REGLAS DEL M??DULO (FAQ & SOPORTE):
     let botReply = aiData.choices?.[0]?.message?.content || 'Error: No se pudo generar una respuesta.';
 
     console.log(`[BOT] ???? Respuesta generada por la IA. Notificando a Meta y CRM...`);
-
+    
     let publicReply = botReply;
     let privateSummary = null;
     let isEmergency = false;
-
+    
     if (publicReply.includes('[URGENCIA_CLINICA]')) {
       isEmergency = true;
       publicReply = publicReply.replace('[URGENCIA_CLINICA]', '').trim();
@@ -1527,7 +1627,7 @@ REGLAS DEL M??DULO (FAQ & SOPORTE):
 
     // 3. Respondiendo de vuelta (P??blico)
     await sendReply(publicReply);
-
+    
     // Si la IA gener?? una nota privada, enviarla al CRM como privada
     if (privateSummary) {
       await sendReply(privateSummary, true);
@@ -1545,7 +1645,7 @@ REGLAS DEL M??DULO (FAQ & SOPORTE):
       } catch (err) {
         console.warn('[BOT] No se pudo actualizar bot_enabled en CRM para emergencia:', err.message);
       }
-
+      
       try {
         const Ably = require('ably');
         const ablyClient = new Ably.Rest(process.env.ABLY_API_KEY);
@@ -1563,14 +1663,14 @@ REGLAS DEL M??DULO (FAQ & SOPORTE):
 
   } catch (error) {
     console.error(`[BOT] ??? Error en el puente Chatwoot-OpenRouter:`, error.message);
-
+    
     // 4. Resiliencia: Loguear el error en Supabase bajo el ID del cliente
     try {
       await supabase
         .from('clientes_bot')
         .update({ ultimo_error_bot: `${new Date().toISOString()} - ${error.message}` })
         .eq('inbox_id', inbox_id);
-
+        
       console.log(`[BOT] ???? Error logueado en Supabase para el inbox_id ${inbox_id}`);
     } catch (logError) {
       console.error(`[BOT] ??? Fall?? tambi??n el guardado del log en Supabase:`, logError.message);
@@ -1628,10 +1728,10 @@ Genera el JSON con el formato solicitado.`;
 
   const aiData = await openRouterResponse.json();
   let content = aiData.choices?.[0]?.message?.content || '{}';
-
+  
   // Clean markdown block if present
   content = content.replace(/^```json\s*/, '').replace(/\s*```$/, '');
-
+  
   return JSON.parse(content);
 }
 
@@ -1643,11 +1743,11 @@ async function vectorizeQnA(inbox_id, qas) {
   if (!openRouterApiKey) throw new Error('Falta OPENROUTER_API_KEY');
 
   const results = [];
-
+  
   for (let i = 0; i < qas.length; i++) {
     const qa = qas[i];
     const textToEmbed = `Pregunta: ${qa.q}\nRespuesta: ${qa.a}`;
-
+    
     try {
       const embedResponse = await fetch('https://openrouter.ai/api/v1/embeddings', {
         method: 'POST',
@@ -1664,7 +1764,7 @@ async function vectorizeQnA(inbox_id, qas) {
       if (!embedResponse.ok) {
         throw new Error(`Error en API de embeddings: ${await embedResponse.text()}`);
       }
-
+      
       const embedData = await embedResponse.json();
       const embeddingArray = embedData.data[0].embedding;
 
@@ -1680,7 +1780,7 @@ async function vectorizeQnA(inbox_id, qas) {
       if (error) {
         throw new Error(`Error insertando en Supabase: ${error.message}`);
       }
-
+      
       results.push({ success: true, question: qa.q });
     } catch (err) {
       results.push({ success: false, question: qa.q, error: err.message });
@@ -1732,11 +1832,11 @@ async function askDynamicQuestions({ description }) {
           const match = matches[0];
           matchedCategory = match.category_name;
           console.log(`[BOT] Plantilla global encontrada: ${match.category_name} (${(match.similarity * 100).toFixed(2)}%)`);
-
+          
           let parsedQuestions = match.essential_questions;
           try {
-            parsedQuestions = JSON.parse(match.essential_questions).join("\n- ");
-          } catch (e) { /* ignorar si ya es texto */ }
+             parsedQuestions = JSON.parse(match.essential_questions).join("\n- ");
+          } catch(e) { /* ignorar si ya es texto */ }
 
           globalTemplateContext = `
 HEMOS IDENTIFICADO ESTA EMPRESA DENTRO DE LA CATEGOR??A: "${match.category_name}".
@@ -1792,7 +1892,7 @@ Por favor, formula las preguntas de seguimiento necesarias.`;
   const aiData = await openRouterResponse.json();
   let content = aiData.choices?.[0]?.message?.content || '{"questions": []}';
   content = content.replace(/^```json\s*/, '').replace(/\s*```$/, '');
-
+  
   const parsedContent = JSON.parse(content);
   return {
     category_name: matchedCategory,
@@ -1858,7 +1958,7 @@ async function chunkAndVectorizeManual(inbox_id, manualContent) {
         .from('company_knowledge')
         .delete()
         .eq('inbox_id', inbox_id.toString());
-
+      
       if (deleteError) {
         console.warn(`[BOT] Advertencia al limpiar memoria anterior: ${deleteError.message}`);
       }
@@ -1872,7 +1972,7 @@ async function chunkAndVectorizeManual(inbox_id, manualContent) {
           master_manual: manualContent,
           updated_at: new Date().toISOString()
         }, { onConflict: 'inbox_id' });
-
+        
       if (profileError) {
         console.warn(`[BOT] Advertencia al guardar el manual maestro: ${profileError.message}`);
       }
@@ -1909,12 +2009,12 @@ INSTRUCCIONES CR??TICAS:
   });
 
   if (!openRouterResponse.ok) throw new Error('Fallo al extraer chunks de OpenRouter');
-
+  
   const aiData = await openRouterResponse.json();
   let content = aiData.choices?.[0]?.message?.content || '{}';
   content = content.replace(/^```json\s*/, '').replace(/\s*```$/, '');
   const parsedQa = JSON.parse(content);
-
+  
   if (!parsedQa.qas || parsedQa.qas.length === 0) {
     throw new Error('La IA no pudo extraer Q&As v??lidas del manual.');
   }
@@ -1968,7 +2068,7 @@ NO respondas con mensajes conversacionales como "Aqu?? tienes el manual", simple
 async function vectorizeSingleQA(question, answer) {
   if (!openRouterApiKey) throw new Error('Falta OPENROUTER_API_KEY');
   const textToEmbed = `Pregunta: ${question}\nRespuesta: ${answer}`;
-
+  
   const embedResponse = await fetch('https://openrouter.ai/api/v1/embeddings', {
     method: 'POST',
     headers: {
@@ -1984,7 +2084,7 @@ async function vectorizeSingleQA(question, answer) {
   if (!embedResponse.ok) {
     throw new Error(`Error en API de embeddings: ${await embedResponse.text()}`);
   }
-
+  
   const embedData = await embedResponse.json();
   return embedData.data[0].embedding;
 }
@@ -2229,17 +2329,17 @@ setInterval(async () => {
       const cs = botRows[0].commerce_settings || {};
       const adminPhones = cs.admin_phones || [];
       if (adminPhones.length > 0) {
-        const adminMsg = 'Han pasado 30+ min sin que valides el pedido *' + ord.order_number + '* (cliente: ' + ord.customer_phone + '). Escribe *confirmar ' + ord.order_number.replace('ORD-', '') + '* o *rechazar ' + ord.order_number.replace('ORD-', '') + '*.';
+        const adminMsg = 'Han pasado 30+ min sin que valides el pedido *' + ord.order_number + '* (cliente: ' + ord.customer_phone + '). Escribe *confirmar ' + ord.order_number.replace('ORD-','') + '* o *rechazar ' + ord.order_number.replace('ORD-','') + '*.';
         for (const ap of adminPhones) {
           try {
             await fetch('https://graph.facebook.com/v20.0/' + ord.inbox_id + '/messages', { method: 'POST', headers: { 'Authorization': 'Bearer ' + process.env.META_ACCESS_TOKEN, 'Content-Type': 'application/json' }, body: JSON.stringify({ messaging_product: 'whatsapp', recipient_type: 'individual', to: String(ap).replace(/^\+/, ''), type: 'text', text: { preview_url: false, body: adminMsg } }) });
-          } catch (e) { }
+          } catch(e) {}
         }
       }
       const clientMsg = 'Disculpa la demora con tu pedido *' + ord.order_number + '*. Nuestro equipo esta verificando tu pago. Si necesitas contacto directo, escribenos al ' + (adminPhones.length > 0 ? '+' + adminPhones[0] : 'numero de la empresa') + '.';
       try {
         await fetch('https://graph.facebook.com/v20.0/' + ord.inbox_id + '/messages', { method: 'POST', headers: { 'Authorization': 'Bearer ' + process.env.META_ACCESS_TOKEN, 'Content-Type': 'application/json' }, body: JSON.stringify({ messaging_product: 'whatsapp', recipient_type: 'individual', to: String(ord.customer_phone).replace(/^\+/, ''), type: 'text', text: { preview_url: false, body: clientMsg } }) });
-      } catch (e) { }
+      } catch(e) {}
       console.log('[COMMERCE] Cron: Pedido stale notificado: ' + ord.order_number);
     }
   } catch (e) { console.warn('[COMMERCE] Cron error:', e.message); }

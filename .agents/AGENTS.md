@@ -4,6 +4,17 @@ This document stores the configuration, production paths, ports, PM2 processes, 
 
 ## 0. CHANGELOG (recent sessions)
 
+### Sep 8, 2026 (Part 3) — Remediación de Seguridad de Credenciales & Renovación de OpenRouter Key
+- **Saneamiento y Blindaje de Git (.gitignore & Untracking):**
+  - Se eliminó `.env` del tracking de Git en `botwaba` (`git rm --cached .env`) tras alerta de OpenRouter por exposición en commit anterior.
+  - Se actualizó `.gitignore` para bloquear exhaustivamente `.env`, `.env.*` y derivados locales. Se creó `.env.example` con valores ficticios.
+  - Se eliminó la clave hardcodeada de Ollama (`OLLAMA_DEFAULT_KEY`) en `llmClient.js`.
+  - En `tech-provider-app`, se eliminaron credenciales hardcodeadas en `generate_embeddings.js` y se ignoró/desindexó la carpeta `scratch/`.
+- **Renovación y Verificación de OpenRouter API Key:**
+  - El usuario generó y configuró una nueva API Key de OpenRouter en `/root/botwaba/.env` del VPS y se sincronizó en el `.env` local.
+  - Verificada la autenticación (`auth/key`) y la generación de embeddings RAG (`baai/bge-m3`, dimensión 1024) con retorno 200 OK.
+  - Servicio `botwaba` reiniciado en PM2 (`pid 1707296`).
+
 ### Sep 8, 2026 (Part 2) — Desacople de Sesión OAuth Facebook & Fix Case-Insensitive de Estado del Bot
 - **Habilitación de Gestión de Agentes e Implementación de `/api/agents` (`/my-agents`):**
   - Se eliminó el bloqueo `isAdmin` en [`app/my-agents/page.tsx`](file:///c:/Users/ragam/antigravity/business-messaging-sample-tech-provider-app/app/my-agents/page.tsx) que generaba pantalla de "Acceso Denegado" para inquilinos y evaluadores externos al hacer clic en "Mi Equipo (Agentes)".

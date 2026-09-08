@@ -4,6 +4,137 @@ This document stores the configuration, production paths, ports, PM2 processes, 
 
 ## 0. CHANGELOG (recent sessions)
 
+### Sep 7-8, 2026 — Arquitectura Multi-Tenant SaaS WhatsApp B2B, Parrilla Finita de Bots, Suiche de Suspensión y Protocolo de Borrado Legal
+- **Aprovisionamiento y Resolución de Inquilinos Facebook/Meta (Griskmon Garcia / LLC):**
+  - Se identificó y resolvió por qué los usuarios registrados vía Meta OAuth no aparecían en el panel de clientes ni respondía el bot: existían en `users`, `wabas` y `phones`, pero carecían de registros vinculados en `meta_saas.saas_tenants`, `meta_saas.saas_clients`, `botwaba.clientes_bot` y `botwaba.user_ai_balance`.
+  - Aprovisionada la cuenta de Griskmon Garcia (`122094948621476626@facebook.com`, línea `1009741852228328` / WhatsApp `+58 422 591 3370`) con modelo `glm-5.3-flash:cloud`, balance de 1,000,000 tokens, módulo `basic_qa` y prompt empresarial de soporte.
+  - Sincronizado el contacto `584225913370` con nombre "Griskmon Garcia" en `meta_saas.contacts` para WABAs `2109313352968146` y `1155651499878023`.
+  - Habilitado el perfil de superadministrador maestro para la cuenta personal de Facebook del usuario (`10242738702392555@facebook.com` / Luis Ramon Garcia Meneses) en `meta_saas.users` y en `authUtils.ts`.
+- **Parrilla Finita de 7 Módulos de Bot (Estandarización Cerrada):**
+  - Se definió e integró la parrilla homogénea en los formularios de cliente y modales de vinculación para evitar combinaciones infinitas:
+    1. `basic_qa`: 💬 1. FAQ & Soporte al Cliente (RAG)
+    2. `lead_gen`: 🎯 2. Ventas Consultivas AIDA (Captura de Leads)
+    3. `commerce`: 🍕 3. Restaurante, Comida & Delivery
+    4. `retail_delivery`: 🛍️ 4. Comercio Minorista / Tiendas Retail
+    5. `taxi`: 🚕 5. Transporte & Taxis (Despacho)
+    6. `appointments`: 📅 6. Citas & Reservas (Turnos)
+    7. `disabled`: 👤 0. Solo CRM (Sin Bot / Atención Humana Exclusiva)
+- **Vinculación 1-Clic en Superadmin CRM (`FacebookUsersManager.tsx` & `/api/admin/facebook-users`):**
+  - En `/crm` (Tab 1 "Usuarios Facebook / Evaluadores Meta"), se agregó el botón **`⚡ Vincular Inquilino & Bot`** que abre un modal directo para asignar nombre de empresa, categoría de bot de la parrilla finita, límite de teléfonos (`max_phones`) y contexto del negocio.
+  - La acción `link_tenant_bot` inserta o actualiza atómicamente en `saas_tenants`, `saas_clients`, `clientes_bot` y `user_ai_balance`, activando el bot automáticamente.
+- **Suiche Maestro de Suspensión ("Si no paga, se corta"):**
+  - En `CRMDashboardClient.tsx` y `FacebookUsersManager.tsx` se integró el suiche visual y botón para alternar entre 🟢 Activo (30d) y 🔴 Cortado / Suspendido.
+  - La acción `suspend` actualiza en cascada `users`, `subscriptions` y `meta_saas.saas_clients.status = 'Suspended'`.
+  - En `app/api/webhooks/route.ts`, se incorporó la validación estricta de facturación: si la cuenta está `Suspended` o `cortado`, el webhook almacena el mensaje por auditoría pero aborta el reenvío a `botwaba` (`http://localhost:4000/api/internal/bot-webhook`), silenciando el bot de inmediato.
+- **Protocolo de Purga Legal / Derecho al Olvido (GDPR & Términos Meta):**
+  - La acción `delete` ahora ejecuta una cascada destructiva segura que elimina: `company_knowledge`, `clientes_bot`, `user_ai_balance`, `saas_clients`, `phones`, `pages`, `instagram_accounts`, `wabas`, `saas_tenants`, `subscriptions` y `users`.
+  - Genera y retorna un código de certificación legal inmutable (ej: `GDPR-PURGE-1788837000000`).
+- **Autogestión de IA por el Inquilino (`/botwaba-knowledge`):**
+  - Se añadió la opción **"Mi Bot & Base de Conocimiento"** en la barra lateral del inquilino (`SidebarLayout.tsx`).
+  - `KnowledgeEditor.tsx` ahora auto-resuelve el `inboxId` del usuario en sesión consultando `/api/profile/plan` si no viene en los parámetros URL, permitiendo al inquilino entrenar su RAG de Preguntas y Respuestas sin intervención del superadmin.
+- **Control y Cumplimiento del Límite de Teléfonos (`max_phones`):**
+  - En `app/api/beUtils.ts` (`getClientPhones`), se verifica contra `meta_saas.saas_tenants.max_phones`. Si el inquilino supera su cuota de números, se omite el auto-registro de líneas extras en `phones`.
+
+### Sep 6, 2026 — Meta App Review Resolution: 13 Permissions Approved, Human Agent Bot Fix & Screencast Video Scripts
+- **Resultado Oficial de Revisión Meta App Review (App ID 1723073642211098):**
+  - **13 Permisos APROBADOS / RENOVADOS:** `whatsapp_business_messaging`, `whatsapp_business_management`, `business_management`, `instagram_business_manage_messages`, `instagram_manage_messages`, `pages_messaging`, `pages_show_list`, `pages_manage_metadata`, `pages_utility_messaging`, `pages_read_engagement`, `public_profile`, `instagram_business_basic`, `instagram_basic`.
+  - **5 Permisos/Funciones para Reenvío:**
+    - `Human Agent` (Rechazado temporalmente por *"Bot de mensajes no funciona"*).
+    - `instagram_manage_comments`, `instagram_business_manage_comments`, `instagram_content_publish`, `instagram_manage_insights` (Rechazados por *"La captura de video no coincide con el caso de uso"*, Meta confirmó que el caso de uso SÍ está permitido).
+- **Fix Integral para Human Agent & Messenger Bot:**
+  - *Causa:* En `app/api/webhooks/messenger/route.ts`, `getAckBotStatus` consultaba únicamente `phones` (números de WhatsApp). Al entrar un mensaje de prueba a la Facebook Page del revisor, `isAckBotEnabled` retornaba `false` y el bot no respondía. Además, el modelo LLM secundario apuntaba a un modelo inexistente (`google/gemma-4-31b-it`).
+  - *Corrección:*
+    1. `isAckBotEnabled` ahora evalúa de forma segura `phones` y permite respuesta predeterminada en Pages/Instagram (`meta_saas.conversations` / `bot_enabled`).
+    2. LLM unificado con `z-ai/glm-5.3-flash` y `google/gemini-2.5-flash`.
+    3. En `app/api/webhooks/messenger/send/route.ts`, el envío manual de agentes desde el CRM ahora utiliza `messaging_type: 'MESSAGE_TAG'` y `tag: 'HUMAN_AGENT'`, con fallback automático a `RESPONSE`.
+- **Estrategia y Guión Obligatorio para los 4 Videos de Screencast:**
+  - Todos los videos deben comenzar obligatoriamente mostrando el **Flujo de Login de Meta (Meta OAuth Dialog)** desde la pantalla de inicio de sesión (`/demo/page.tsx` o `/login`) aceptando los permisos requeridos.
+  - Video 1 (`Human Agent`): Login → mensaje de usuario → bot transfiere a humano → agente responde desde CRM con etiqueta verde `HUMAN_AGENT`.
+  - Video 2 (`instagram_manage_comments`): Login → comentario en post de IG → entrada en vivo al CRM → respuesta pública u ocultar comentario → verificación en Instagram.
+  - Video 3 (`instagram_content_publish`): Login → redactor en CRM → publicar post con imagen en Instagram → verificación en perfil de Instagram.
+  - Video 4 (`instagram_manage_insights`): Login → pestaña de Insights/Analíticas en CRM → visualización de métricas de alcance, seguidores e impresiones vía `GET /{ig-user-id}/insights`.
+- **Deploy en Producción:**
+  - Archivos sincronizados vía SCP a `/root/crm-saas/` y `/root/botwaba/`.
+  - Eliminados archivos temporales en raíz `/root/crm-saas/app/` y ejecutado `npm run build && pm2 restart crm-saas && pm2 restart botwaba`.
+
+### Sep 5, 2026 (Part 2) — Ollama Cloud Primary (glm-5.3-flash:cloud) & OpenRouter Fallback (z-ai/glm-5.3-flash)
+- **Cliente LLM Unificado con Failover Automático (`llmClient.js`):**
+  - Se implementó `callLlmChat` con arquitectura primaria / secundaria transparente:
+    - **Primario:** Ollama Cloud (`https://ollama.com/v1/chat/completions`) con el modelo `glm-5.3-flash:cloud` y la API Key del usuario.
+    - **Fallback:** En caso de caída, timeout (25s) o respuesta no-200 de Ollama, conmuta automáticamente a OpenRouter con el modelo `z-ai/glm-5.3-flash`.
+  - Incluye limpiador automático de bloques `<think>...</think>` para modelos de razonamiento profundo.
+- **Migración Integral de Módulos:**
+  - `food_delivery.js`: el LLM conversacional y la extracción natural de pedidos (`extractOrderWithLLM`) ahora utilizan `callLlmChat`.
+  - `retail.js`: flujo conversacional migrado a `callLlmChat`.
+  - `aiService.js`: flujo `basic_qa`, extracción de conocimiento `/aprender`, generación de manuales operativos y `aiGenerate` migrados a `callLlmChat`.
+- **Configuración en `.env` (Local y Servidor):**
+  - Añadidos `OLLAMA_API_KEY`, `OLLAMA_BASE_URL`, `OLLAMA_MODEL=glm-5.3-flash:cloud`, `OPENROUTER_FALLBACK_MODEL=z-ai/glm-5.3-flash` y `MODELO_POR_DEFECTO=glm-5.3-flash:cloud`.
+  - Servicio `botwaba` reiniciado con `--update-env` en PM2 y verificado online.
+
+### Sep 5, 2026 — Driver/Admin Activation Keywords & Meta Send Diagnostics
+- **Activación de Turno para Motorizados y Admin (Ventana 24h Meta):**
+  - En `aiService.js`, se añadieron las palabras clave `activo`, `activar`, `disponible`, `conectado` a los comandos de repartidor y admin.
+  - Al reportarse con `activo`, el bot confirma el registro del turno, abre la ventana de 24 horas de Meta (User-Initiated Conversation) y genera un nuevo enlace temporal PWA de despacho válido por 24h.
+- **Diagnóstico en Tiempo Real de Mensajería WhatsApp:**
+  - En `sendToPhone` (`aiService.js`), se añadió la captura y logging de `res.ok` y del cuerpo de respuesta de Meta Graph API v20.0 para auditar instantáneamente en logs cualquier entrega exitosa o rechazo de ventana (ej: error 131047).
+
+### Sep 3, 2026 (Part 3) — KDS Payment Status Isolation, Natural Language Order Extraction & Forgiving Admin Commands
+- **Ultra-Fast 300ms Debounce:**
+  - Reducido el debounce de agrupación de mensajes en `aiService.js` de `600ms` a `300ms`. Latencia de respuesta global reducida a ~1.2s manteniéndose el indicador de escritura ("Escribiendo...") inmediato en los primeros 100ms.
+- **KDS Queue Isolation (Cocina solo tras confirmar pago):**
+  - Actualizado `app/api/orders-dashboard/orders/route.ts` para que el rol `kitchen` filtre estrictamente `['paid', 'preparing', 'ready']`, excluyendo `pending`.
+  - La pantalla KDS (`/kds` y `KitchenApp.tsx`) solo lista pedidos en "Por Preparar" cuando el administrador o cajero ha verificado el comprobante y aprobado el pago (`status: 'paid'`).
+- **Extracción Natural de Pedidos desde la Conversación (LLM + Regex):**
+  - En `modules/food_delivery.js` se añadieron los extractores `extractOrderWithLLM` y `parseOrderFromText` con blindaje contra datos bancarios/teléfonos.
+  - Al recibir una captura de pago móvil (`msgType === 'image'`), si el carrito o los datos de entrega no estaban estructurados, el sistema analiza el historial reciente de mensajes mediante `google/gemini-2.5-flash` en OpenRouter y extrae los platos naturales acordados (ej: *"Promo Estrella"*, *"1/2 kg de cochino al tambor"*, *"Picadillo Llanero"*), cantidades, dirección de delivery, modalidad y total en USD/Bs.
+  - Se eliminó el problema de pedidos guardados con `items: []` o `total_usd: 0.00`.
+- **Flexibilidad en Comandos Administrativos:**
+  - En `aiService.js`, el parser de comandos de administración ahora admite `confirmar`, `confirmado`, `aprobar`, `aprobado` y resuelve pedidos por número simple (ej: `confirmar 13` o `confirmado 13 9`) buscando por coincidencia parcial de secuencia en `botwaba.pedidos`.
+
+### Sep 3, 2026 (Part 2) — Standalone Kitchen Display System (KDS) & PIN Auth
+- **Standalone KDS App:**
+  - Created a distraction-free, full-screen KDS application for kitchen tablets within the main Next.js project.
+  - Route: `/kds` (implemented via `app/kds/page.tsx` and `KitchenApp.tsx`).
+  - Layout isolation: Global footer hidden via CSS injection, `SidebarLayout` completely bypassed to ensure 100% full screen.
+- **PIN-based Kitchen Authentication:**
+  - Designed to avoid complex login typing on tablets.
+  - Added `kds_pin` column (VARCHAR 10) to `botwaba.commerce_businesses` table.
+  - New API Route `POST /api/kds/auth` validates the PIN and returns the associated `inboxId` and `businessId`.
+  - The KDS frontend polls `GET /api/orders-dashboard/orders` using both IDs every 10 seconds to auto-refresh the kitchen queue.
+- **Security & Deployment:**
+  - Temporary PIN `1234` injected directly to the database via SQL for the Asadero Génesis demo.
+  - Added proper CORS headers to `/api/orders-dashboard/orders` to ensure future external PWA scalability if needed, although current implementation remains natively integrated.
+
+
+### Sep 3, 2026 — Typing Indicator Inmediato, Multi-Demo Switch & Corrección Anti-Alucinación (Asadero Génesis)
+- **Indicador de Escritura (Typing Indicator) Inmediato:**
+  - Se agregó la función `sendTypingIndicator` en `aiService.js` (botwaba) para llamar al endpoint de Meta Graph API enviando el estado de "escribiendo..." apenas el bot comienza a procesar el mensaje.
+  - Esto se ejecuta de forma asíncrona y no bloqueante, brindando la sensación de atención humana e inmediata mientras el servicio LLM (OpenRouter) demora unos segundos en procesar la respuesta. El indicador desaparece automáticamente cuando llega el mensaje del bot.
+- **Concepto Crítico: Número Personal como Showroom de Demos:**
+  - El número WhatsApp personal del usuario (`+584265708509` / `phone_number_id: 1213848621804009`) se utiliza como laboratorio dinámico para prospectar clientes en vivo.
+  - Los clientes SaaS reales tienen cada uno su propio número de teléfono y WABA exclusivo, con bots fijos predeterminados.
+  - Para el número personal compartido, la tabla `meta_saas.saas_clients` utiliza la columna `is_active_demo = true` para redirigir dinámicamente el tráfico entrante al cliente demo seleccionado vía `effectiveInboxId` en `aiService.js`.
+  - El endpoint `POST /api/crm/demo-switch` apaga los demos previos del mismo número y activa el seleccionado, invalidando la clave Redis `inbox:${realPhoneNumberId}:config`.
+- **Diagnóstico y Corrección de Alucinación en Asadero Génesis:**
+  - *Causa de la falla:* `AsaderoGenesis` estaba configurado con `bot_module_type = 'commerce'`. `food_delivery.js` no encontraba negocio en `botwaba.commerce_businesses` ni catálogo en `meta_saas.catalog_products`, por lo que caía en el fallback hardcodeado `'Negocio Comida'`, con menú vacío. Al recibir ese prompt, la IA alucinaba papas fritas y hamburguesas (a pesar de tener 16 Q&As en `company_knowledge` que prohíben explícitamente vender comida rápida).
+  - *Blindaje en `modules/food_delivery.js`:*
+    1. Eliminado el fallback `'Negocio Comida'`: ahora resuelve el nombre y naturaleza de la empresa dinámicamente desde `meta_saas.saas_clients`.
+    2. Inyección de Conocimiento: carga automáticamente las preguntas/respuestas oficiales de `botwaba.company_knowledge` (sedes, políticas, métodos de pago, etc.).
+    3. Agrupación dinámica del menú por categoría con descripción y precio real en USD.
+    4. Regla estricta anti-alucinación: prohíbe terminantemente inventar platos ajenos al menú y exige ofrecer amablemente las opciones de la casa cuando solicitan algo no disponible.
+- **Configuración de Asadero Génesis en Base de Datos:**
+  - Catálogo `catalog_id: 3100000000000001` creado en `meta_saas.catalogs` con 9 productos reales en `meta_saas.catalog_products` (Promo Estrella Combo Pollo Completo $11, Cochino al Barril $19.99, Carne de Res al Barril $15, Almuerzo Ejecutivo $6, Cachapas $3, Picadillo $4, Bebidas: Refresco 1.5L $2.50, Refresco 500ml $1.50, Agua $1). NO incluye yuca, tostones ni extras inventados.
+  - Negocio registrado en `botwaba.commerce_businesses` (`AsaderoGenesis`, `is_active = true`, `bot_model_type = 'FOOD_DELIVERY'`).
+  - `admin_phones` (vendedor): `["584225913370"]` — comandos: `pendientes`, `confirmar`, `listo`, `rechazar`.
+  - `driver_phones` (motorizado): `["584245913370"]` — comandos: `motorizado`, `repartidor`, `pedidos`, `repartos`.
+  - Cache de Redis purgada y servicio `botwaba` reiniciado y guardado con `pm2 save`.
+- **Fix: Admin bloqueaba mensajes normales con "Comandos disponibles":**
+  - *Bug:* Cuando un teléfono registrado como admin (`admin_phones`) enviaba CUALQUIER mensaje que no fuera un comando operativo (`pendientes`, `confirmar`, etc.), `aiService.js` le respondía con el texto de ayuda de comandos y hacía `return`, bloqueando completamente el flujo del bot. El admin no podía conversar con el bot para probar la demo.
+  - *Fix quirúrgico en `aiService.js` (sección 3.5 Commerce admin commands):*
+    1. La ayuda de comandos ahora SOLO se muestra cuando el admin escribe explícitamente `comandos`, `ayuda` o `help`.
+    2. Si el mensaje del admin no coincide con ningún comando operativo conocido, el código **no hace `return`**, sino que cae al flujo regular del bot (sección 4: Commerce LLM) para que pueda conversar normalmente.
+  - **REGLA PARA AGENTES FUTUROS:** NUNCA quitar teléfonos de `admin_phones` para resolver problemas de flujo. Los admin_phones del usuario son sagrados: deben poder gestionar pedidos Y probar la demo como cliente.
+
 ### Aug 17-18, 2026 — Supabase 100-Year Tokens, PostgreSQL Direct Pool Migration & 600ms Debounce
 - **Supabase 100-Year Token Renewal:**
   - Old default 1-year tokens issued Aug 7, 2025 (`iat: 1754605117`, `exp: 1786141117`) expired on Aug 7, 2026, causing PostgREST `401 Unauthorized` / `JWT expired` errors across CRM and Bot.

@@ -9,6 +9,7 @@ async function handleRetailMessage({
   context,
   pgPool,
   quickSend,
+  sendToPhone,
   upsertCommerceSession,
   getInteractiveMenuPayload,
   analyzePaymentCapture,
@@ -229,35 +230,61 @@ async function handleRetailMessage({
       try {
         await pgPool.query('INSERT INTO botwaba.pedidos (order_number, inbox_id, customer_phone, items, subtotal_usd, delivery_fee_usd, total_usd, total_bs, bcv_rate, delivery_type, delivery_address, payment_info, proof_media_url, status, business_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)', [orderNumber, inbox_id, recipient, JSON.stringify(session.cart || '[]'), totalUsd, deliveryFee, totalUsd + deliveryFee, totalBs, orderRate, deliveryType, deliveryAddress, JSON.stringify(paymentInfo), msgMedia, 'pending', bizBusinessId]);
       } catch(e) {}
-      await upsertCommerceSession(pgPool, inbox_id, recipient, { state: 'WAITING_CONFIRMATION', current_item: JSON.stringify({ order_number: orderNumber, proof_media_url: msgMedia, delivery_type: deliveryType }) });
+      await upsertCommerceSession(pgPool, inbox_id, recipient, { state: 'IDLE', cart: '[]', order_total_usd: 0, current_item: 'null' });
       
       let detailsText = '';
-      if (extractedInfo) {
-        detailsText = '\n\n📊 *Detalles del Pago Móvil extraídos:*' +
-          '\n- *Banco Destino:* ' + (extractedInfo.banco_destino || 'N/D') +
-          '\n- *Referencia:* ' + (extractedInfo.referencia || 'N/D') +
-          '\n- *Monto Extraído:* ' + (extractedInfo.monto_bs ? parseFloat(extractedInfo.monto_bs).toFixed(2) + ' Bs' : 'N/D') +
-          '\n- *Monto Esperado:* ' + totalBs.toFixed(2) + ' Bs';
+      if (extractedInfo && (extractedInfo.referencia || extractedInfo.banco_destino)) {
+        detailsText = '\n\n📊 *Detalles del Comprobante:*' +
+          (extractedInfo.banco_destino ? '\n- *Banco:* ' + extractedInfo.banco_destino : '') +
+          (extractedInfo.referencia ? '\n- *Referencia:* ' + extractedInfo.referencia : '') +
+          (extractedInfo.monto_bs ? '\n- *Monto Extraído:* ' + parseFloat(extractedInfo.monto_bs).toFixed(2) + ' Bs' : '');
       }
-      await quickSend('Recibí tu comprobante para el pedido *' + orderNumber + '* por *$' + (totalUsd + deliveryFee).toFixed(2) + '* (Bs. ' + totalBs.toFixed(2) + ').' + detailsText + '\n\n¿Estás seguro de que este es el comprobante correcto?\nResponde *Si* o *No*');
+
+      // 1. Mensaje al Cliente
+      const clientAck = '¡Comprobante de pago recibido! 🧾✨\n\n' +
+        'Tu pedido *#' + orderNumber + '* por *$' + (totalUsd + deliveryFee).toFixed(2) + '* (Bs. ' + totalBs.toFixed(2) + ') está registrado en estado pendiente.' +
+        detailsText +
+        '\n\nEl administrador verificará la acreditación del pago en la cuenta bancaria. En cuanto sea confirmado por administración, procederemos con el despacho. Te avisaremos enseguida. 🙌';
+      await quickSend(clientAck);
+
+      // 2. Alerta Inmediata a los Administradores
+      if (Array.isArray(bizAdminPhones) && bizAdminPhones.length > 0 && typeof sendToPhone === 'function') {
+        const adminAlertText = `🔔 *Nuevo Pago Móvil por Verificar*\n\n` +
+          `📋 *Pedido:* ${orderNumber}\n` +
+          `👤 *Cliente:* ${customerName || recipient} (+${recipient})\n` +
+          `💰 *Total:* $${(totalUsd + deliveryFee).toFixed(2)} (Bs. ${totalBs.toFixed(2)})\n` +
+          (extractedInfo && extractedInfo.referencia ? `🔢 *Ref:* ${extractedInfo.referencia}\n` : '') +
+          (extractedInfo && extractedInfo.banco_destino ? `🏦 *Banco:* ${extractedInfo.banco_destino}\n` : '') +
+          `📍 *Modalidad:* ${deliveryType === 'delivery' ? '🛵 Delivery' : '🛍️ Retiro en Tienda'}` +
+          (deliveryAddress ? `\n📍 *Dirección:* ${deliveryAddress}` : '') + `\n\n` +
+          `*Para aprobar:*` +
+          `\n👉 Escribe: *confirmar ${orderNumber.replace('ORD-', '')}*` +
+          `\n\n*Para rechazar el pago:*` +
+          `\n👉 Escribe: *rechazar ${orderNumber.replace('ORD-', '')}*`;
+
+        for (const adminPhone of bizAdminPhones) {
+          try {
+            await sendToPhone(adminPhone, adminAlertText, msgMedia);
+          } catch(e) {
+            console.error('[RETAIL] Error enviando alerta a admin:', adminPhone, e.message);
+          }
+        }
+      }
       return;
     }
   }
 
-  // CASO 2: Confirmación Si/No
+  // CASO 2: Confirmación Si/No residual
   if (session && session.state === 'WAITING_CONFIRMATION' && message_content) {
     const answer = message_content.toLowerCase().trim();
     let pendingItem = null; try { pendingItem = typeof session.current_item === 'string' ? JSON.parse(session.current_item || '{}') : (session.current_item || {}); } catch(e) {}
     const orderNumber = pendingItem ? pendingItem.order_number : null;
+    await upsertCommerceSession(pgPool, inbox_id, recipient, { state: 'IDLE', current_item: 'null', cart: '[]' });
     if (answer === 'si' || answer === 'sí' || answer === 's' || answer === 'yes') {
-      await upsertCommerceSession(pgPool, inbox_id, recipient, { state: 'IDLE', current_item: 'null' });
-      const isDelivery = pendingItem && pendingItem.delivery_type === 'delivery';
-      const etaMin = isDelivery ? 45 : 30;
-      await quickSend('Comprobante confirmado! Pedido *' + orderNumber + '* en revisión.\n\nTiempo estimado: *' + etaMin + ' minutos*.\n\nSi no recibes noticias en ' + etaMin + ' min, escríbenos al ' + (bizAdminPhones.length > 0 ? '+' + bizAdminPhones[0] : 'este número') + '.');
+      await quickSend('Tu pedido *' + (orderNumber || '') + '* está en revisión por administración. En cuanto sea confirmado por el administrador, te avisaremos de inmediato.');
       return;
     } else if (answer === 'no' || answer === 'n') {
       if (orderNumber) try { await pgPool.query('UPDATE botwaba.pedidos SET status=$1, updated_at=NOW() WHERE order_number=$2 AND inbox_id=$3', ['cancelled', orderNumber, inbox_id]); } catch(e) {}
-      await upsertCommerceSession(pgPool, inbox_id, recipient, { state: 'IDLE', current_item: 'null' });
       await quickSend('No hay problema. Puedes enviar el comprobante correcto cuando quieras.');
       return;
     }
@@ -336,21 +363,20 @@ async function handleRetailMessage({
   const messagesPayload = [{ role: 'system', content: prompt }, ...historyMessages, { role: 'user', content: message_content }];
   
   const llmStart = Date.now();
-  const llmResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'Authorization': 'Bearer ' + openRouterApiKey, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: aiModel, messages: messagesPayload })
-  });
-  
-  if (!llmResponse.ok) return;
-  const aiData = await llmResponse.json();
-  const latencyMs = Date.now() - llmStart;
-  
-  if (aiData.usage && typeof deductAiTokens === 'function') {
-    await deductAiTokens(aiData.usage, latencyMs, bizAdminPhones);
-  }
+  let botReply = 'No pude procesar tu mensaje.';
+  try {
+    const { callLlmChat } = require('../llmClient');
+    const llmRes = await callLlmChat({ messages: messagesPayload });
+    const latencyMs = Date.now() - llmStart;
 
-  let botReply = aiData.choices?.[0]?.message?.content || 'No pude procesar tu mensaje.';
+    if (llmRes.usage && typeof deductAiTokens === 'function') {
+      await deductAiTokens(llmRes.usage, latencyMs, bizAdminPhones);
+    }
+    botReply = llmRes.content || 'No pude procesar tu mensaje.';
+  } catch (err) {
+    console.error('[RETAIL] Error en llamada LLM:', err.message);
+    return;
+  }
   
   const hasHandoff = botReply.includes('[HANDOFF]');
   if (hasHandoff) botReply = botReply.replace('[HANDOFF]', '').trim();

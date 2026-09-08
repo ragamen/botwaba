@@ -502,6 +502,114 @@ app.post('/api/onboarding/vectorizar_manual', async (req, res) => {
 });
 
 // ==========================================
+// PLANTILLAS DE DEMOS (DEMO TEMPLATES)
+// ==========================================
+
+// Listar todas las plantillas de demostración
+app.get('/api/onboarding/templates', async (req, res) => {
+  try {
+    const { rows } = await pgPool.query(
+      `SELECT id, title, category_key, business_nature, bot_module_type, description, master_manual, created_at 
+       FROM botwaba.demo_templates 
+       ORDER BY created_at ASC`
+    );
+    res.json({ templates: rows || [] });
+  } catch (error) {
+    console.error('Error al listar demo templates:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Guardar nueva plantilla o actualizar existente
+app.post('/api/onboarding/templates/save', async (req, res) => {
+  try {
+    const { title, category_key, business_nature, bot_module_type, description, master_manual } = req.body;
+    if (!title || !master_manual) {
+      return res.status(400).json({ error: 'Falta título o manual para la plantilla' });
+    }
+    const key = category_key || title.toLowerCase().replace(/[^a-z0-9]/g, '_');
+    const { rows } = await pgPool.query(
+      `INSERT INTO botwaba.demo_templates (title, category_key, business_nature, bot_module_type, description, master_manual)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (category_key) DO UPDATE SET
+         title = EXCLUDED.title,
+         business_nature = EXCLUDED.business_nature,
+         bot_module_type = EXCLUDED.bot_module_type,
+         description = EXCLUDED.description,
+         master_manual = EXCLUDED.master_manual
+       RETURNING *`,
+      [title, key, business_nature || 'General', bot_module_type || 'basic_qa', description || '', master_manual]
+    );
+    res.json({ success: true, template: rows[0] });
+  } catch (error) {
+    console.error('Error al guardar demo template:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Aplicar plantilla completa a un inbox de demo
+app.post('/api/onboarding/templates/apply', async (req, res) => {
+  try {
+    const { inbox_id, template_id } = req.body;
+    if (!inbox_id || !template_id) {
+      return res.status(400).json({ error: 'Faltan parámetros inbox_id o template_id' });
+    }
+
+    const { rows: tRows } = await pgPool.query(
+      `SELECT * FROM botwaba.demo_templates WHERE id = $1 LIMIT 1`,
+      [template_id]
+    );
+    if (!tRows || tRows.length === 0) {
+      return res.status(404).json({ error: 'Plantilla no encontrada' });
+    }
+    const t = tRows[0];
+
+    // 1. Actualizar configuración en clientes_bot
+    await pgPool.query(
+      `UPDATE botwaba.clientes_bot 
+       SET bot_module_type = $1 
+       WHERE inbox_id = $2`,
+      [t.bot_module_type, inbox_id.toString()]
+    );
+
+    // 2. Actualizar configuración en saas_clients (si existe)
+    await pgPool.query(
+      `UPDATE meta_saas.saas_clients 
+       SET business_nature = $1 
+       WHERE inbox_id = $2`,
+      [t.business_nature, inbox_id.toString()]
+    );
+
+    // 3. Guardar el manual maestro en company_profiles
+    await pgPool.query(
+      `INSERT INTO botwaba.company_profiles (inbox_id, master_manual, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (inbox_id) DO UPDATE SET
+         master_manual = EXCLUDED.master_manual,
+         updated_at = NOW()`,
+      [inbox_id.toString(), t.master_manual]
+    );
+
+    // 4. Si el módulo usa RAG vectorial (basic_qa, appointments, lead_gen, retail_delivery)
+    if (['basic_qa', 'appointments', 'lead_gen', 'retail_delivery'].includes(t.bot_module_type)) {
+      await chunkAndVectorizeManual(inbox_id.toString(), t.master_manual);
+    } else {
+      // Limpiar memoria anterior para que no contamine otros módulos como commerce o taxi
+      await pgPool.query(`DELETE FROM botwaba.company_knowledge WHERE inbox_id = $1`, [inbox_id.toString()]);
+    }
+
+    res.json({
+      success: true,
+      message: `Plantilla "${t.title}" aplicada con éxito al inbox ${inbox_id}. Módulo activo: ${t.bot_module_type}.`,
+      template: t
+    });
+  } catch (error) {
+    console.error('Error al aplicar demo template:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==========================================
 // EDITOR DE CONOCIMIENTO (Q&A CRUD)
 // ==========================================
 
@@ -784,6 +892,62 @@ app.get('/api/crm/clients', async (req, res) => {
   }
 });
 
+// Demo Switch: Activar un demo específico en un número compartido
+app.post('/api/crm/demo-switch', async (req, res) => {
+  try {
+    const { inbox_id } = req.body;
+    if (!inbox_id) return res.status(400).json({ error: 'inbox_id is required' });
+
+    // 1. Find the whatsapp_number for this inbox
+    const { rows: scRows } = await pgPool.query(
+      'SELECT whatsapp_number FROM meta_saas.saas_clients WHERE inbox_id = $1 LIMIT 1',
+      [inbox_id]
+    );
+    if (scRows.length === 0) return res.status(404).json({ error: 'Client not found' });
+    const whatsappNumber = scRows[0].whatsapp_number;
+
+    // 2. Deactivate all demos with the same whatsapp_number
+    await pgPool.query(
+      'UPDATE meta_saas.saas_clients SET is_active_demo = false WHERE whatsapp_number = $1',
+      [whatsappNumber]
+    );
+
+    // 3. Activate the selected demo
+    await pgPool.query(
+      'UPDATE meta_saas.saas_clients SET is_active_demo = true WHERE inbox_id = $1',
+      [inbox_id]
+    );
+
+    // 4. Find the real phone_number_id to clear its Redis cache
+    const { rows: realPhoneRows } = await pgPool.query(
+      `SELECT p.phone_id FROM meta_saas.phones p
+       JOIN meta_saas.saas_clients sc ON sc.whatsapp_number = '+' || REPLACE(REPLACE(REPLACE(p.phone_id::text, ' ', ''), '-', ''), '+', '')
+       WHERE sc.inbox_id = $1 LIMIT 1`,
+      [inbox_id]
+    );
+    // Also try matching by the real phone_number_id inbox
+    const { rows: realInboxRows } = await pgPool.query(
+      `SELECT inbox_id FROM meta_saas.saas_clients 
+       WHERE whatsapp_number = $1 AND inbox_id ~ '^[0-9]+$' LIMIT 1`,
+      [whatsappNumber]
+    );
+    const realPhoneNumberId = realInboxRows.length > 0 ? realInboxRows[0].inbox_id : null;
+
+    // 5. Clear Redis config cache so the bot reloads immediately
+    if (realPhoneNumberId && redisClient.isReady) {
+      const cacheKey = `inbox:${realPhoneNumberId}:config`;
+      await redisClient.del(cacheKey);
+      console.log(`[DEMO-SWITCH] Cleared Redis cache: ${cacheKey}`);
+    }
+
+    console.log(`[DEMO-SWITCH] Activated demo '${inbox_id}' for number ${whatsappNumber}`);
+    res.json({ success: true, active_inbox_id: inbox_id, whatsapp_number: whatsappNumber });
+  } catch (error) {
+    console.error('[DEMO-SWITCH] Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Crear o actualizar un cliente
 app.post('/api/crm/clients', async (req, res) => {
   try {
@@ -876,77 +1040,84 @@ app.put('/api/crm/clients/:id', async (req, res) => {
       return res.status(400).json({ error: 'Faltan campos obligatorios' });
     }
 
-    // 1. Get current client to see if inbox_id changed
-    const { data: currentClient, error: fetchError } = await supabaseMeta
-      .from('saas_clients')
-      .select('inbox_id')
-      .eq('id', id)
-      .single();
-      
-    if (fetchError) throw fetchError;
-    const oldInboxId = currentClient.inbox_id;
+    const db = pgPool;
+    if (!db) {
+      return res.status(500).json({ error: 'No hay conexión a base de datos (pgPool no inicializado)' });
+    }
 
-    // 2. Update saas_clients
-    const { data, error } = await supabaseMeta
-      .from('saas_clients')
-      .update({
-        inbox_id: inbox_id.toString(),
-        company_name,
-        business_nature,
-        whatsapp_number,
-        facebook_page_id,
-        instagram_account_id,
+    // 1. Obtener inbox_id actual para detectar si cambió
+    const { rows: currentRows } = await db.query(
+      'SELECT inbox_id FROM meta_saas.saas_clients WHERE id = $1',
+      [id]
+    );
+    if (currentRows.length === 0) {
+      return res.status(404).json({ error: 'Cliente no encontrado' });
+    }
+    const oldInboxId = currentRows[0].inbox_id;
+
+    // 2. Actualizar meta_saas.saas_clients
+    const { rows: updatedRows } = await db.query(
+      `UPDATE meta_saas.saas_clients
+       SET inbox_id = $1, company_name = $2, business_nature = $3,
+           whatsapp_number = $4, facebook_page_id = $5, instagram_account_id = $6,
+           page_access_token = $7, subscription_plan = $8, balance_due = $9, status = $10
+       WHERE id = $11
+       RETURNING *`,
+      [
+        inbox_id.toString(), company_name, business_nature,
+        whatsapp_number, facebook_page_id, instagram_account_id,
         page_access_token,
-        subscription_plan: subscription_plan || 'Basic',
-        balance_due: balance_due || 0,
-        status: status || 'Active'
-      })
-      .eq('id', id)
-      .select();
-      
-    if (error) throw error;
-    
-    // 3. If inbox_id changed, update it in related tables as well
+        subscription_plan || 'Basic', balance_due || 0, status || 'Active',
+        id
+      ]
+    );
+
+    // 3. Si cambió el inbox_id, actualizar tablas relacionadas
     if (oldInboxId && oldInboxId !== inbox_id.toString()) {
-      await supabase
-        .from('clientes_bot')
-        .update({ inbox_id: inbox_id.toString() })
-        .eq('inbox_id', oldInboxId);
-        
-      await supabase
-        .from('company_knowledge')
-        .update({ inbox_id: inbox_id.toString() })
-        .eq('inbox_id', oldInboxId);
+      await db.query(
+        'UPDATE botwaba.clientes_bot SET inbox_id = $1 WHERE inbox_id = $2',
+        [inbox_id.toString(), oldInboxId]
+      );
+      await db.query(
+        'UPDATE botwaba.company_knowledge SET inbox_id = $1 WHERE inbox_id = $2',
+        [inbox_id.toString(), oldInboxId]
+      );
     }
 
-    // 4. Consultar configuración existente
-    const { data: existingBot } = await supabase
-      .from('clientes_bot')
-      .select('system_prompt, chatwoot_token, chatwoot_url, ai_model')
-      .eq('inbox_id', inbox_id.toString())
-      .single();
+    // 4. Consultar config existente de clientes_bot (para no pisar system_prompt, etc.)
+    const { rows: botRows } = await db.query(
+      'SELECT system_prompt, chatwoot_token, chatwoot_url, ai_model FROM botwaba.clientes_bot WHERE inbox_id = $1',
+      [inbox_id.toString()]
+    );
+    const existingBot = botRows[0] || null;
 
-    // 5. Update or insert clientes_bot values
-    const { error: botError } = await supabase
-      .from('clientes_bot')
-      .upsert({
-        inbox_id: inbox_id.toString(),
-        chatwoot_token: existingBot?.chatwoot_token || page_access_token || 'temp_token',
-        chatwoot_url: existingBot?.chatwoot_url || 'https://soporte.mbtech.work',
-        ai_model: existingBot?.ai_model || 'openai/gpt-4o-mini',
-        system_prompt: existingBot?.system_prompt || `Eres el asistente de ventas oficial de la empresa "${company_name}", cuya naturaleza de negocio es: ${business_nature || 'Soporte'}.`,
-        bot_module_type: bot_module_type || 'basic_qa',
-        is_delivery_enabled: is_delivery_enabled === true || is_delivery_enabled === 'true',
-        address_details: address_details || {"street": "", "city": "", "pickup_instructions": ""},
-        payment_pago_movil: payment_pago_movil || {"banco": "", "rif": "", "telefono": "", "nombre_titular": "", "enabled": false},
-        commerce_settings: commerce_settings || {"catalog_id": "", "currency": "USD", "delivery_fee": 0.00, "min_order_value": 0.00}
-      }, { onConflict: 'inbox_id' });
+    // 5. Upsert en botwaba.clientes_bot
+    await db.query(
+      `INSERT INTO botwaba.clientes_bot
+         (inbox_id, chatwoot_token, chatwoot_url, ai_model, system_prompt,
+          bot_module_type, is_delivery_enabled, address_details, payment_pago_movil, commerce_settings)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       ON CONFLICT (inbox_id) DO UPDATE SET
+         bot_module_type      = EXCLUDED.bot_module_type,
+         is_delivery_enabled  = EXCLUDED.is_delivery_enabled,
+         address_details      = EXCLUDED.address_details,
+         payment_pago_movil   = EXCLUDED.payment_pago_movil,
+         commerce_settings    = EXCLUDED.commerce_settings`,
+      [
+        inbox_id.toString(),
+        existingBot?.chatwoot_token || page_access_token || 'temp_token',
+        existingBot?.chatwoot_url   || 'https://soporte.mbtech.work',
+        existingBot?.ai_model       || 'openai/gpt-4o-mini',
+        existingBot?.system_prompt  || `Eres el asistente de ventas oficial de la empresa "${company_name}", cuya naturaleza de negocio es: ${business_nature || 'Soporte'}.`,
+        bot_module_type || 'basic_qa',
+        is_delivery_enabled === true || is_delivery_enabled === 'true',
+        JSON.stringify(address_details      || { street: '', city: '', pickup_instructions: '' }),
+        JSON.stringify(payment_pago_movil   || { banco: '', rif: '', telefono: '', nombre_titular: '', enabled: false }),
+        JSON.stringify(commerce_settings    || { catalog_id: '', currency: 'USD', delivery_fee: 0.00, min_order_value: 0.00 })
+      ]
+    );
 
-    if (botError) {
-      console.error('[API] Error al actualizar clientes_bot:', botError.message);
-    }
-
-    // 6. Invalidate config cache in Redis
+    // 6. Invalidar cache de Redis
     const configCacheKey = `inbox:${inbox_id}:config`;
     try {
       await redisClient.del(configCacheKey);
@@ -957,12 +1128,13 @@ app.put('/api/crm/clients/:id', async (req, res) => {
       console.warn(`[Redis] Error al invalidar caché tras actualizar cliente:`, err.message);
     }
 
-    res.json({ message: 'Cliente actualizado exitosamente', client: data[0] });
+    res.json({ message: 'Cliente actualizado exitosamente', client: updatedRows[0] });
   } catch (error) {
     console.error('Error updating client:', error);
     res.status(500).json({ error: error.message });
   }
 });
+
 
 // Obtener WABAs desde Supabase (Para el dropdown de Nuevo Cliente)
 app.get('/api/crm/wabas', async (req, res) => {

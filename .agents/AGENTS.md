@@ -4,6 +4,18 @@ This document stores the configuration, production paths, ports, PM2 processes, 
 
 ## 0. CHANGELOG (recent sessions)
 
+### Sep 8, 2026 (Part 4) — Aislamiento Multi-Tenant en Campañas de Instagram & UX Onboarding de IG
+- **Aislamiento Multi-Tenant en Campañas de Instagram (`/api/instagram-campaigns`):**
+  - Se identificó fuga de datos donde inquilinos externos (ej: Griskmon Garcia / `122094948621476626@facebook.com`) veían en `/my-instagram-campaigns` las campañas del Superadmin (`Default Luis Ramon`, `Default WifiSpotNet`, `Default Al Día con tu Cuerpo`) debido a un `SELECT *` irrestricto.
+  - Se modificó [`app/api/instagram-campaigns/route.ts`](file:///c:/Users/ragam/antigravity/business-messaging-sample-tech-provider-app/app/api/instagram-campaigns/route.ts) para filtrar por las cuentas de Instagram vinculadas del inquilino mediante `JOIN meta_saas.instagram_accounts`.
+  - Se añadieron verificaciones de propiedad en `POST`, `PUT` y `DELETE` para impedir creación o alteración no autorizada de campañas ajenas.
+- **Mejora de UX en Onboarding de Instagram (`InstagramCampaignsClient.tsx`):**
+  - Cuando el inquilino no tiene cuentas comerciales vinculadas, el banner ahora incluye el botón interactivo **`[ 📸 Vincular Cuenta de Instagram → ]`** con enlace directo a [`/my-instagram-accounts`](file:///c:/Users/ragam/antigravity/business-messaging-sample-tech-provider-app/app/my-instagram-accounts/page.tsx).
+- **Corrección de Encoding en Base de Datos:**
+  - Se sanearon los caracteres `??` en los registros de `meta_saas.instagram_campaigns` restaurando acentos en español.
+- **Deploy en Producción:**
+  - Compilado con `npm run build` y reiniciado el proceso `crm-saas` en PM2 (`pid 1762091`).
+
 ### Sep 8, 2026 (Part 3) — Remediación de Seguridad de Credenciales & Renovación de OpenRouter Key
 - **Saneamiento y Blindaje de Git (.gitignore & Untracking):**
   - Se eliminó `.env` del tracking de Git en `botwaba` (`git rm --cached .env`) tras alerta de OpenRouter por exposición en commit anterior.

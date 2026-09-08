@@ -466,9 +466,9 @@ async function doProcessMessage(payload) {
 
   const { aiModel, system_prompt, activeBusinessName, activeBusinessNature, botModuleType, activeIsDelivery, activeAddress, activePaymentMovil, commerceSettings, status, created_at, subscription_expires_at } = botConfig;
 
-  // 1. Guardarropa de Seguridad: Si el cliente est?? suspendido o inactivo en el CRM
-  if (status && status !== 'Active') {
-    console.log(`[BOT] ???? El cliente con inbox_id ${inbox_id} no est?? activo (Estado: ${status}). El bot no responder??.`);
+  // 1. Guardarropa de Seguridad: Si el cliente está suspendido o inactivo en el CRM
+  if (status && status.toLowerCase() !== 'active') {
+    console.log(`[BOT] ⚠️ El cliente con inbox_id ${inbox_id} no está activo (Estado: ${status}). El bot no responderá.`);
     return;
   }
 

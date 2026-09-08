@@ -4,7 +4,6 @@
 // Secundario/Fallback: OpenRouter (z-ai/glm-5.3-flash)
 'use strict';
 
-const OLLAMA_DEFAULT_KEY = '0ae046c5630a4258b0fc1f52c8a353b0.5b8py6AnO6krNwHmqkKoH7-L';
 
 /**
  * Limpia posibles etiquetas <think>...</think> de modelos con razonamiento
@@ -26,7 +25,7 @@ function cleanThinking(text) {
  * @returns {Promise<{ content: string, usage: Object|null, model: string, provider: 'ollama'|'openrouter' }>}
  */
 async function callLlmChat({ messages, response_format, temperature, timeoutMs = 25000 }) {
-  const ollamaKey = process.env.OLLAMA_API_KEY || OLLAMA_DEFAULT_KEY;
+  const ollamaKey = process.env.OLLAMA_API_KEY;
   const ollamaBaseUrl = process.env.OLLAMA_BASE_URL || 'https://ollama.com/v1';
   const ollamaModel = process.env.OLLAMA_MODEL || 'glm-5.3-flash:cloud';
 

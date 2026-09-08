@@ -4,6 +4,27 @@ This document stores the configuration, production paths, ports, PM2 processes, 
 
 ## 0. CHANGELOG (recent sessions)
 
+### Sep 8, 2026 (Part 2) — Desacople de Sesión OAuth Facebook & Fix Case-Insensitive de Estado del Bot
+- **Habilitación de Gestión de Agentes e Implementación de `/api/agents` (`/my-agents`):**
+  - Se eliminó el bloqueo `isAdmin` en [`app/my-agents/page.tsx`](file:///c:/Users/ragam/antigravity/business-messaging-sample-tech-provider-app/app/my-agents/page.tsx) que generaba pantalla de "Acceso Denegado" para inquilinos y evaluadores externos al hacer clic en "Mi Equipo (Agentes)".
+  - Se creó el endpoint faltante [`app/api/agents/route.ts`](file:///c:/Users/ragam/antigravity/business-messaging-sample-tech-provider-app/app/api/agents/route.ts) con soporte para GET (listar operadores), POST (crear agente con contraseña hasheada sha256) y DELETE (eliminar operador protegiendo superadmins).
+  - Esto también resuelve la asignación de chats en `/my-inbox` (`currentUserKey`), permitiendo que el inquilino atienda y asigne chats a su equipo.
+- **Habilitación de Módulos de Instagram & Páginas para Evaluadores Meta e Inquilinos (`SidebarLayout.tsx`):**
+  - Se eliminó el bloqueo `isAdmin` en la barra lateral para:
+    - `Post Auto-Responder` (`/post-autoresponder`): moderación de comentarios, publicación de posts y analíticas.
+    - `Campañas de Instagram` (`/my-instagram-campaigns`): automatización con bots de IA.
+    - `Mis Páginas` (`/my-pages`): Facebook Pages vinculadas.
+    - `Mis Cuentas de Instagram` (`/my-instagram-accounts`): Insights y métricas de Instagram Graph API.
+  - Esto garantiza que los evaluadores de Meta App Review que inicien sesión con cuentas de prueba externas puedan evaluar los permisos de Instagram sin toparse con menús ocultos o "Acceso Denegado". Solo el panel `/crm` se mantiene estrictamente exclusivo para el Superadmin.
+- **Desacople de Sesión Facebook OAuth (`facebook-login/route.ts`):**
+  - Se eliminó a Griskmon (`122094948621476626`) de `adminFbIds`, permitiendo que su sesión resuelva su identidad auténtica de inquilino (`122094948621476626@facebook.com`) y no sea secuestrado hacia `admin@mbtech.work`.
+- **Blindaje Case-Insensitive de Estado en `botwaba/aiService.js`:**
+  - Se detectó que el bot bloqueaba respuestas con el log *"El cliente con inbox_id ... no está activo (Estado: active)"* debido a una comparación estricta `status !== 'Active'`.
+  - Corregido a `status.toLowerCase() !== 'active'` tanto en local como en producción VPS.
+  - Purgada la clave Redis `inbox:1009741852228328:config`, actualizado `saas_clients.status = 'Active'` y `subscription_expires_at = NOW() + 30 days`.
+- **Comportamiento Human Agent Handoff en CRM:**
+  - Al enviar un mensaje manual desde `/my-inbox` (botón enviar), el CRM pasa la conversación a atención humana (`bot_enabled = false`), desmarcando la casilla `Bot [ ]`. El agente puede reactivar al bot en cualquier momento marcando nuevamente la casilla `Bot [x]`.
+
 ### Sep 7-8, 2026 — Arquitectura Multi-Tenant SaaS WhatsApp B2B, Parrilla Finita de Bots, Suiche de Suspensión y Protocolo de Borrado Legal
 - **Aprovisionamiento y Resolución de Inquilinos Facebook/Meta (Griskmon Garcia / LLC):**
   - Se identificó y resolvió por qué los usuarios registrados vía Meta OAuth no aparecían en el panel de clientes ni respondía el bot: existían en `users`, `wabas` y `phones`, pero carecían de registros vinculados en `meta_saas.saas_tenants`, `meta_saas.saas_clients`, `botwaba.clientes_bot` y `botwaba.user_ai_balance`.

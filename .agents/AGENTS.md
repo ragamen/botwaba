@@ -4,6 +4,22 @@ This document stores the configuration, production paths, ports, PM2 processes, 
 
 ## 0. CHANGELOG (recent sessions)
 
+### Sep 9, 2026 — Preparación & Snapshot de Memoria para Migración Completa a Ubuntu
+- **Snapshot y Verificación de Repositorios Git:**
+  - Todos los repositorios locales (`botwaba`, `business-messaging-sample-tech-provider-app`, `meta`) verificados y 100% limpios y sincronizados con sus remotes en GitHub en rama `main`.
+  - Mapeo de remotes:
+    - `botwaba` → `https://github.com/ragamen/botwaba.git`
+    - `business-messaging-sample-tech-provider-app` (`crm-saas`) → `https://github.com/ragamen/tech-provider-app.git`
+    - `meta` (`tech-whatsapp`) → `https://github.com/ragamen/tech-whatsapp.git`
+    - `meta-app-review-demo` → standalone demo directory.
+- **Resguardo y Requisitos de Variables de Entorno (.env):**
+  - Los archivos `.env` (en `botwaba`) y `.env.local` (en `tech-provider-app`) se mantienen protegidos en `.gitignore` con sus respectivas plantillas `.env.example`.
+  - Se detallan todas las claves críticas para el setup en Ubuntu: PostgreSQL (`54322`), Redis (`6379`), Ably Realtime, OpenRouter / Ollama Cloud (`glm-5.3-flash:cloud`), Supabase JWT (100 años), y Meta Tech Provider App ID `1723073642211098`.
+- **Estado de Producción en VPS (Ubuntu Server `45.134.226.235`):**
+  - Procesos PM2 activos: `crm-saas` (puerto `3005`) y `botwaba` (puerto `4000`).
+  - Nginx reverse proxy y contenedores Docker (Supabase PostgREST, PostgreSQL, Redis) operativos.
+  - Multi-tenant con 7 módulos estándar de bot, suiche de suspensión, aislamiento de campañas de Instagram y Human Agent tag listos para producción y Meta App Review.
+
 ### Sep 8, 2026 (Part 4) — Aislamiento Multi-Tenant en Campañas de Instagram & UX Onboarding de IG
 - **Aislamiento Multi-Tenant en Campañas de Instagram (`/api/instagram-campaigns`):**
   - Se identificó fuga de datos donde inquilinos externos (ej: Griskmon Garcia / `122094948621476626@facebook.com`) veían en `/my-instagram-campaigns` las campañas del Superadmin (`Default Luis Ramon`, `Default WifiSpotNet`, `Default Al Día con tu Cuerpo`) debido a un `SELECT *` irrestricto.
